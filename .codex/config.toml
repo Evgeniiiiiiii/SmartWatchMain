@@ -1,0 +1,7 @@
+model = "gpt-5.4"
+
+[project]
+name = "SmartWatchProj"
+
+[instructions]
+file = "AGENTS.md"
