@@ -1,0 +1,26 @@
+# Visual Studio / VS
+.vs/
+**/.vs/
+*.user
+*.suo
+
+# Build output
+bin/
+obj/
+**/bin/
+**/obj/
+
+# Publish profiles user settings
+*.pubxml.user
+
+# Archives
+*.zip
+*.rar
+*.7z
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
