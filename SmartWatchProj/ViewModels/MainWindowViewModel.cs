@@ -17,6 +17,7 @@ using PdfSharpCore.Drawing;
 using PdfSharpCore.Pdf;
 using SkiaSharp;
 using SmartWatchProj.Models;
+using SmartWatchProj.Models.Devices;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
@@ -115,7 +116,7 @@ namespace SmartWatchProj.ViewModels
         //[ObservableProperty] private bool isTopInfoVisible;
         private List<int> selectedCaptchaIndices = new List<int>();  // Выбранные индексы
         private List<int> correctCaptchaIndices = new List<int>();  // Индексы с targetDigit
-        private TaskCompletionSource<VitalMeasurement>? _measurementCompletion;  // Для ожидания результата измерений
+        private TaskCompletionSource<MeasurementWorkflowResult>? _measurementCompletion;  // Для ожидания результата измерений
 
         private const string EmployeesJsonPath = "employees.json";
         private const string MeasurementsJsonPath = "measurements.json";
@@ -146,6 +147,7 @@ namespace SmartWatchProj.ViewModels
                 }
                 CaptchaItems = new ObservableCollection<int>(Enumerable.Repeat(0, 9));  // Инициализация с 9 плейсхолдерами
                 isCaptchaSelected = new ObservableCollection<bool>(Enumerable.Repeat(false, 9));
+                InitializeOperationalServices();
             }
             catch (Exception ex)
             {
@@ -207,17 +209,32 @@ namespace SmartWatchProj.ViewModels
         {
             try
             {
-                ClearTopInfo();//
+                ClearTopInfo();
+                if (!EnsureEmployeeConfirmed())
+                {
+                    return;
+                }
+
+                if (!DeviceModules.Any(device => device.IsEnabled))
+                {
+                    ShowTopInfo("Нет включенных устройств. Проверьте настройки оборудования.", Brushes.Red);
+                    return;
+                }
+
+                if (!DeviceModules.Any(device => device.IsEnabled && device.Status == DeviceStatus.Ready))
+                {
+                    await CheckEquipment();
+                }
+
+                if (!DeviceModules.Any(device => device.IsEnabled && device.Status == DeviceStatus.Ready))
+                {
+                    ShowTopInfo("Нет готовых устройств. Выполните проверку оборудования.", Brushes.Red);
+                    return;
+                }
+
                 IsCollectingData = true;
                 ResultMessage = "Проверка пользователя...";
                 ResultColor = Avalonia.Media.Brushes.Black;
-                await CheckEmployeeByCardId();
-                if (!IsEmployeeFound)
-                {
-                    ShowTopInfo("Сотрудник не найден", Brushes.Red);
-                    IsCollectingData = false;
-                    return;
-                }
                 bool verified = await VerifyUserWithCamera();
                 if (!verified)
                 {
@@ -234,25 +251,9 @@ namespace SmartWatchProj.ViewModels
                 GenerateCaptcha();
 
                 // Ожидаем завершения измерений
-                _measurementCompletion = new TaskCompletionSource<VitalMeasurement>();
-                var measurement = await _measurementCompletion.Task;
-
-                // Анализ и остальное
-                var (verdict, verdictColor, healthTiles) = CalculateDetailedDiagnosis(measurement);
-                DetailedHealthTiles = new ObservableCollection<HealthTile>(healthTiles);
-                VerdictColor = verdictColor;
-                UpdateTilesWithStatuses(healthTiles, verdict);
-                string humanMessage = GenerateHumanRecommendation(measurement, healthTiles);
-                measurement.Diagnosis = humanMessage;
-                measurement.Recommendation = verdict;
-                HumanRecommendation = humanMessage;
-                ShowDetailedResult = true;
-                measurements.Add(measurement);
-                sessionMeasurements.Add(measurement);
-                SaveMeasurementsToJson();
-                UpdateLastData();
-                ResultMessage = $"Результат: {verdict}";
-                ResultColor = verdictColor;
+                _measurementCompletion = new TaskCompletionSource<MeasurementWorkflowResult>();
+                var workflowResult = await _measurementCompletion.Task;
+                ApplyWorkflowResult(workflowResult, persistMeasurement: workflowResult.HasAnyRealData, isTestRun: false);
             }
             catch (Exception ex)
             {
@@ -265,6 +266,8 @@ namespace SmartWatchProj.ViewModels
                 IsCollectingData = false;
                 StopCamera();
                 IsOverlayVisible = false;
+                ProgressValue = 0;
+                CurrentInstruction = string.Empty;
             }
         }
 
@@ -374,7 +377,7 @@ namespace SmartWatchProj.ViewModels
                 IsCaptchaVisible = false;  // Скрываем CAPTCHA
 
                 // Запускаем процесс измерений
-                _ = StartMeasurementProcessAsync();  // Async, результат через TCS
+                _ = StartMeasurementProcessAsync(isTestRun: false);  // Async, результат через TCS
             }
             else
             {
@@ -392,45 +395,7 @@ namespace SmartWatchProj.ViewModels
 
         private async Task StartMeasurementProcessAsync()
         {
-            string[] instructions = new string[]
-            {
-        "Подключение часов",
-        "Прислонитесь к измерителю температуры",
-        "Дуньте в алкотестер",
-        "Поместите манжету на руку",
-        "Поместите палец в глюкометр"
-            };
-
-            int totalSteps = instructions.Length;
-            for (int i = 0; i < totalSteps; i++)
-            {
-                CurrentInstruction = instructions[i];
-                ProgressValue = (i / (double)totalSteps) * 100;
-                await Task.Delay(5000);  // Симуляция
-            }
-
-            ProgressValue = 100;
-            await Task.Delay(1000);
-
-            // Симуляция measurement
-            var random = new Random();
-            var measurement = new VitalMeasurement
-            {
-                EmployeeId = currentEmployeeId,
-                Timestamp = DateTime.Now,
-                HeartRate = random.Next(50, 150),
-                Saturation = random.Next(85, 100),
-                EcgData = "simulated_ecg",
-                ActivityLevel = random.Next(1000, 3000),
-                BloodPressureSystolic = random.Next(90, 160),
-                BloodPressureDiastolic = random.Next(60, 100),
-                Temperature = 35 + random.NextDouble() * 3,
-                Glucose = 4 + random.NextDouble() * 3,
-                Cholesterol = 4 + random.NextDouble() * 3,
-                AlcoholLevel = random.NextDouble() * 1.5
-            };
-
-            _measurementCompletion?.SetResult(measurement);
+            await StartMeasurementProcessAsync(isTestRun: false);
         }
 
 
@@ -651,20 +616,18 @@ namespace SmartWatchProj.ViewModels
         /// </summary>
         private async Task CheckEmployeeByCardId()
         {
-            await Task.Delay(100);
+            await Task.Yield();
 
-            var employee = Employees.FirstOrDefault(e => e.CardId == CardId);
+            var employee = ResolveEmployeeFromInputs();
 
             if (employee != null)
             {
-                IsEmployeeFound = true;
-                currentEmployeeId = employee.Id;
+                ApplyConfirmedEmployee(employee);
                 Console.WriteLine($"Найден сотрудник ID={employee.Id}");
             }
             else
             {
-                IsEmployeeFound = false;
-                currentEmployeeId = 0;
+                ClearConfirmedEmployee();
                 Console.WriteLine($"Сотрудник с CardId={CardId} не найден");
             }
         }
@@ -986,7 +949,10 @@ namespace SmartWatchProj.ViewModels
         private void ResetForNextEmployee()
         {
             CardId = string.Empty;
+            ManualEmployeeId = string.Empty;
+            SelectedEmployee = null;
             IsEmployeeFound = false;
+            ConfirmedEmployeeDisplay = "Сотрудник не подтвержден";
             CameraFrame = null;
             InstructionMessage = "Готово. Подходите следующий сотрудник.";
             ResultMessage = string.Empty;

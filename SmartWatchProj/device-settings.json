@@ -1,0 +1,52 @@
+{
+  "devices": [
+    {
+      "sortOrder": 1,
+      "deviceId": "temperature",
+      "displayName": "Термометр",
+      "moduleType": 0,
+      "connectionType": 0,
+      "portMode": 0,
+      "portName": "",
+      "baudRate": 115200,
+      "timeoutMs": 12000,
+      "enabled": true
+    },
+    {
+      "sortOrder": 2,
+      "deviceId": "alcohol",
+      "displayName": "Алкотестер",
+      "moduleType": 1,
+      "connectionType": 0,
+      "portMode": 0,
+      "portName": "",
+      "baudRate": 115200,
+      "timeoutMs": 12000,
+      "enabled": true
+    },
+    {
+      "sortOrder": 3,
+      "deviceId": "pressure",
+      "displayName": "Тонометр",
+      "moduleType": 2,
+      "connectionType": 0,
+      "portMode": 0,
+      "portName": "",
+      "baudRate": 115200,
+      "timeoutMs": 15000,
+      "enabled": true
+    },
+    {
+      "sortOrder": 4,
+      "deviceId": "wearable",
+      "displayName": "Носимое устройство",
+      "moduleType": 3,
+      "connectionType": 0,
+      "portMode": 0,
+      "portName": "",
+      "baudRate": 115200,
+      "timeoutMs": 15000,
+      "enabled": false
+    }
+  ]
+}
