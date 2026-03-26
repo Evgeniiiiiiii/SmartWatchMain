@@ -27,13 +27,25 @@ namespace SmartWatchProj.ViewModels
         [ObservableProperty] private string deviceConfigurationPath = string.Empty;
         [ObservableProperty] private string deviceLogPath = string.Empty;
         [ObservableProperty] private string manualEmployeeId = string.Empty;
-        [ObservableProperty] private bool isEquipmentPanelExpanded;
+        [ObservableProperty] private bool isEquipmentPanelVisible;
         [ObservableProperty] private Employee? selectedEmployee;
         [ObservableProperty] private string confirmedEmployeeDisplay = "Сотрудник не подтвержден";
         [ObservableProperty] private bool isCheckingEquipment;
         [ObservableProperty] private bool canStartMeasurement;
         [ObservableProperty] private bool canStartTestRun;
         [ObservableProperty] private string lastWorkflowSummary = string.Empty;
+
+        [RelayCommand]
+        private void ToggleEquipmentPanel()
+        {
+            IsEquipmentPanelVisible = !IsEquipmentPanelVisible;
+        }
+
+        [RelayCommand]
+        private void CloseEquipmentPanel()
+        {
+            IsEquipmentPanelVisible = false;
+        }
 
         private void InitializeOperationalServices()
         {
@@ -199,6 +211,7 @@ namespace SmartWatchProj.ViewModels
                 }
 
                 IsCollectingData = true;
+                IsEquipmentPanelVisible = false;
                 IsOverlayVisible = true;
                 IsCaptchaVisible = false;
                 CurrentInstruction = "Подготовка тестового прогона";

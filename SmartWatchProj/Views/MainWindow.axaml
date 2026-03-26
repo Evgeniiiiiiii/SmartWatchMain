@@ -110,10 +110,45 @@
 		</Grid.RowDefinitions>
 
         <!-- Р—Р°РіРѕР»РѕРІРѕРє СЃ РёРєРѕРЅРєРѕР№ -->
-		<StackPanel Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="3" Orientation="Horizontal" HorizontalAlignment="Left" Margin="0,0,0,20">
-			<Image Source="/Assets/rosgaz-logo.png" Width="64" Height="64" Margin="0,0,10,0" />
-			<TextBlock Text="Мониторинг здоровья сотрудников" FontSize="28" FontWeight="SemiBold" VerticalAlignment="Center" Foreground="Black" />
-		</StackPanel>
+		<Grid Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="3"
+			  ColumnDefinitions="*,Auto"
+			  ColumnSpacing="20"
+			  Margin="0,0,0,20">
+			<StackPanel Orientation="Horizontal" HorizontalAlignment="Left">
+				<Image Source="/Assets/rosgaz-logo.png" Width="64" Height="64" Margin="0,0,10,0" />
+				<TextBlock Text="Мониторинг здоровья сотрудников" FontSize="28" FontWeight="SemiBold" VerticalAlignment="Center" Foreground="Black" />
+			</StackPanel>
+
+			<Border Grid.Column="1"
+					Background="#FFFFFFCC"
+					CornerRadius="16"
+					Padding="14,10"
+					BorderBrush="#22000000"
+					BorderThickness="1"
+					BoxShadow="0 8 20 0 #14000000"
+					VerticalAlignment="Center">
+				<Grid ColumnDefinitions="*,Auto" ColumnSpacing="14">
+					<StackPanel Spacing="2" MinWidth="0">
+						<TextBlock Text="Оборудование"
+								   FontSize="12"
+								   FontWeight="SemiBold"
+								   Opacity="0.75"/>
+						<TextBlock Text="{Binding EquipmentCompactSummary}"
+								   Foreground="{Binding EquipmentSummaryColor}"
+								   FontSize="13"
+								   FontWeight="SemiBold"
+								   TextWrapping="Wrap"
+								   MaxWidth="260"/>
+					</StackPanel>
+
+					<Button Grid.Column="1"
+							Content="Открыть"
+							Command="{Binding ToggleEquipmentPanelCommand}"
+							MinWidth="120"
+							HorizontalContentAlignment="Center"/>
+				</Grid>
+			</Border>
+		</Grid>
 
 		<!-- Р›РµРІР°СЏ РїР°РЅРµР»СЊ: Р’РІРѕРґ Рё СѓРїСЂР°РІР»РµРЅРёРµ (СЂРѕРІРЅР°СЏ РєРѕР»РѕРЅРєР° + СЃРѕРѕР±С‰РµРЅРёСЏ) -->
 		<StackPanel Grid.Row="1" Grid.Column="0"
@@ -228,225 +263,6 @@
 					</StackPanel>
 				</Border>
 			</Grid>
-		</Border>
-
-		<Border Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="3"
-				Background="#FFFFFF"
-				CornerRadius="16"
-				Padding="12"
-				BorderBrush="#22000000"
-				BorderThickness="1"
-				BoxShadow="0 10 24 0 #22000000"
-				Margin="0,0,0,12">
-
-			<Expander IsExpanded="{Binding IsEquipmentPanelExpanded}">
-				<Expander.Header>
-					<Grid ColumnDefinitions="*,Auto" ColumnSpacing="16">
-						<StackPanel Spacing="4">
-							<TextBlock Text="Оборудование и настройки"
-									   FontSize="16"
-									   FontWeight="SemiBold"/>
-							<TextBlock Text="{Binding EquipmentCompactSummary}"
-									   Foreground="{Binding EquipmentSummaryColor}"
-									   FontSize="12"
-									   FontWeight="SemiBold"
-									   TextWrapping="Wrap"/>
-						</StackPanel>
-
-						<Border Grid.Column="1"
-								Background="#FFF3E0"
-								CornerRadius="999"
-								Padding="12,6"
-								VerticalAlignment="Center">
-							<TextBlock Text="Подготовка к запуску"
-									   FontSize="12"
-									   FontWeight="SemiBold"
-									   Foreground="#A64500"/>
-						</Border>
-					</Grid>
-				</Expander.Header>
-
-				<Grid Margin="0,16,0,0"
-					  ColumnDefinitions="340,*"
-					  ColumnSpacing="18"
-					  MinHeight="0">
-					<StackPanel Grid.Column="0" Spacing="10" VerticalAlignment="Top">
-						<TextBlock Text="Подготовка к реальному запуску"
-								   FontSize="16"
-								   FontWeight="SemiBold"/>
-
-						<TextBlock Text="Раздел раскрывается только при необходимости, поэтому основной экран остаётся компактным."
-								   FontSize="12"
-								   Opacity="0.75"
-								   TextWrapping="Wrap"/>
-
-						<TextBox Text="{Binding ManualEmployeeId}"
-								 Watermark="EmployeeId (ручной ввод)"
-								 MinHeight="36"/>
-
-						<ComboBox ItemsSource="{Binding Employees}"
-								  SelectedItem="{Binding SelectedEmployee}"
-								  MinHeight="36">
-							<ComboBox.ItemTemplate>
-								<DataTemplate x:DataType="models:Employee">
-									<TextBlock Text="{Binding Name, StringFormat='{}{0}'}"/>
-								</DataTemplate>
-							</ComboBox.ItemTemplate>
-						</ComboBox>
-
-						<Button Content="Подтвердить сотрудника"
-								Command="{Binding ConfirmEmployeeCommand}"
-								HorizontalContentAlignment="Center"/>
-
-						<Border Background="#FFF8E1"
-								CornerRadius="12"
-								Padding="10">
-							<TextBlock Text="{Binding ConfirmedEmployeeDisplay}"
-									   TextWrapping="Wrap"
-									   FontWeight="SemiBold"/>
-						</Border>
-
-						<Grid ColumnDefinitions="*,*" ColumnSpacing="8">
-							<Button Grid.Column="0"
-									Content="Проверить оборудование"
-									Command="{Binding CheckEquipmentCommand}"
-									HorizontalContentAlignment="Center"/>
-							<Button Grid.Column="1"
-									Content="Сохранить настройки"
-									Command="{Binding SaveDeviceSettingsCommand}"
-									HorizontalContentAlignment="Center"/>
-						</Grid>
-
-						<Button Content="Тестовый прогон"
-								Command="{Binding StartTestRunCommand}"
-								IsEnabled="{Binding CanStartTestRun}"
-								HorizontalContentAlignment="Center"/>
-
-						<Border Background="#F5F5F5"
-								CornerRadius="12"
-								Padding="10">
-							<StackPanel Spacing="4">
-								<TextBlock Text="Сводка оборудования"
-										   FontSize="13"
-										   FontWeight="SemiBold"/>
-								<TextBlock Text="{Binding EquipmentSummary}"
-										   Foreground="{Binding EquipmentSummaryColor}"
-										   FontWeight="Bold"
-										   TextWrapping="Wrap"/>
-							</StackPanel>
-						</Border>
-
-						<TextBlock Text="{Binding DeviceConfigurationPath, StringFormat='Конфиг: {0}'}"
-								   FontSize="10"
-								   TextWrapping="Wrap"/>
-						<TextBlock Text="{Binding DeviceLogPath, StringFormat='Лог: {0}'}"
-								   FontSize="10"
-								   TextWrapping="Wrap"/>
-					</StackPanel>
-
-					<Grid Grid.Column="1" RowDefinitions="Auto,*" RowSpacing="10" MinHeight="0">
-						<StackPanel Spacing="4">
-							<TextBlock Text="Модули оборудования"
-									   FontSize="15"
-									   FontWeight="SemiBold"/>
-							<TextBlock Text="Карточки устройств доступны по требованию и прокручиваются только внутри своей области."
-									   FontSize="12"
-									   Opacity="0.75"
-									   TextWrapping="Wrap"/>
-						</StackPanel>
-
-						<ScrollViewer Grid.Row="1"
-								  VerticalScrollBarVisibility="Auto"
-								  HorizontalScrollBarVisibility="Disabled"
-								  MaxHeight="320"
-								  MinHeight="0">
-							<ItemsControl ItemsSource="{Binding DeviceModules}">
-								<ItemsControl.ItemTemplate>
-									<DataTemplate x:DataType="devices:DeviceModuleState">
-										<Border Background="#FAFAFA"
-												CornerRadius="12"
-												Padding="12"
-												BorderBrush="#18000000"
-												BorderThickness="1"
-												Margin="0,0,0,10">
-											<Grid RowDefinitions="Auto,Auto,Auto" RowSpacing="8">
-												<Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
-													<TextBlock Text="{Binding DisplayName}"
-															   FontWeight="SemiBold"
-															   FontSize="14"
-															   TextWrapping="Wrap"/>
-													<Border Grid.Column="1"
-															Background="{Binding StatusBrush}"
-															CornerRadius="999"
-															Padding="8,3">
-														<TextBlock Text="{Binding StatusText}"
-																   Foreground="White"
-																   FontSize="11"
-																   FontWeight="Bold"/>
-													</Border>
-												</Grid>
-
-												<TextBlock Grid.Row="1"
-														   Text="{Binding StatusDetails}"
-														   FontSize="12"
-														   TextWrapping="Wrap"/>
-
-												<Grid Grid.Row="2" RowDefinitions="Auto,Auto" RowSpacing="8" MinWidth="0">
-													<Grid ColumnDefinitions="Auto,180,*" ColumnSpacing="10" MinWidth="0">
-														<CheckBox Content="Вкл"
-																  IsChecked="{Binding IsEnabled}"
-																  VerticalAlignment="Center"/>
-
-														<StackPanel Grid.Column="1" Spacing="4">
-															<TextBlock Text="Режим порта"
-																	   FontSize="11"
-																	   Opacity="0.75"/>
-															<ComboBox ItemsSource="{Binding PortModes}"
-																	  SelectedItem="{Binding PortMode}"
-																	  MinHeight="34"
-																	  MinWidth="160"/>
-														</StackPanel>
-
-														<StackPanel Grid.Column="2" Spacing="4" MinWidth="0">
-															<TextBlock Text="COM"
-																	   FontSize="11"
-																	   Opacity="0.75"/>
-															<TextBox Text="{Binding PortName}"
-																	 Watermark="COM"
-																	 IsEnabled="{Binding CanEditPortName}"
-																	 MinHeight="34"/>
-														</StackPanel>
-													</Grid>
-
-													<Grid Grid.Row="1" ColumnDefinitions="*,*" ColumnSpacing="10" MinWidth="0">
-														<StackPanel Grid.Column="0" Spacing="4" MinWidth="0">
-															<TextBlock Text="Baud rate"
-																	   FontSize="11"
-																	   Opacity="0.75"/>
-															<TextBox Text="{Binding BaudRate}"
-																	 Watermark="Baud rate"
-																	 MinHeight="34"/>
-														</StackPanel>
-
-														<StackPanel Grid.Column="1" Spacing="4" MinWidth="0">
-															<TextBlock Text="Timeout, ms"
-																	   FontSize="11"
-																	   Opacity="0.75"/>
-															<TextBox Text="{Binding TimeoutMs}"
-																	 Watermark="Timeout ms"
-																	 MinHeight="34"/>
-														</StackPanel>
-													</Grid>
-												</Grid>
-											</Grid>
-										</Border>
-									</DataTemplate>
-								</ItemsControl.ItemTemplate>
-							</ItemsControl>
-						</ScrollViewer>
-					</Grid>
-				</Grid>
-			</Expander>
 		</Border>
 
 		<Border Grid.Row="1" Grid.Column="1"
@@ -646,6 +462,266 @@
 		<Button Grid.Row="5" Grid.Column="2" Content="Завершить и выйти" Command="{Binding FinishAndExitCommand}" Width="200" HorizontalContentAlignment="Center" Margin="0,0,10,0" HorizontalAlignment="Right" VerticalAlignment="Bottom" Padding="16,8" />
 
 	
+		<Grid x:Name="EquipmentOverlay"
+			  Grid.Row="0" Grid.Column="0"
+			  Grid.RowSpan="10" Grid.ColumnSpan="10"
+			  Background="#7A000000"
+			  IsVisible="{Binding IsEquipmentPanelVisible}"
+			  HorizontalAlignment="Stretch"
+			  VerticalAlignment="Stretch"
+			  IsHitTestVisible="True"
+			  ZIndex="90">
+
+			<Button Command="{Binding CloseEquipmentPanelCommand}"
+					Background="Transparent"
+					BorderBrush="Transparent"
+					BorderThickness="0"
+					CornerRadius="0"
+					Padding="0"
+					Opacity="0"
+					HorizontalAlignment="Stretch"
+					VerticalAlignment="Stretch" />
+
+			<Border Background="#FFFFFF"
+					CornerRadius="20"
+					Padding="20"
+					BorderBrush="#22000000"
+					BorderThickness="1"
+					BoxShadow="0 16 40 0 #30000000"
+					Width="960"
+					Height="560"
+					HorizontalAlignment="Center"
+					VerticalAlignment="Center">
+				<Grid RowDefinitions="Auto,*" RowSpacing="16">
+					<Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="12">
+						<StackPanel Spacing="4" VerticalAlignment="Center">
+							<TextBlock Text="Оборудование и настройки"
+									   FontSize="20"
+									   FontWeight="SemiBold"/>
+							<TextBlock Text="{Binding EquipmentCompactSummary}"
+									   Foreground="{Binding EquipmentSummaryColor}"
+									   FontSize="13"
+									   FontWeight="SemiBold"
+									   TextWrapping="Wrap"/>
+						</StackPanel>
+
+						<Border Grid.Column="1"
+								Background="#FFF3E0"
+								CornerRadius="999"
+								Padding="12,6"
+								VerticalAlignment="Center">
+							<TextBlock Text="Подготовка к запуску"
+									   FontSize="12"
+									   FontWeight="SemiBold"
+									   Foreground="#A64500"/>
+						</Border>
+
+						<Button Grid.Column="2"
+								Content="X"
+								Command="{Binding CloseEquipmentPanelCommand}"
+								Width="40"
+								Height="40"
+								Padding="0"
+								HorizontalContentAlignment="Center"
+								VerticalContentAlignment="Center"/>
+					</Grid>
+
+					<Grid Grid.Row="1"
+						  ColumnDefinitions="320,*"
+						  ColumnSpacing="18"
+						  MinHeight="0">
+						<ScrollViewer Grid.Column="0"
+								  VerticalScrollBarVisibility="Auto"
+								  HorizontalScrollBarVisibility="Disabled"
+								  MinHeight="0">
+							<StackPanel Spacing="10" Margin="0,0,8,0">
+								<TextBlock Text="Подготовка к реальному запуску"
+										   FontSize="16"
+										   FontWeight="SemiBold"/>
+
+								<TextBlock Text="В этом окне собраны проверка оборудования, сотрудник и тестовый прогон. Основной экран при этом не смещается."
+										   FontSize="12"
+										   Opacity="0.75"
+										   TextWrapping="Wrap"/>
+
+								<TextBox Text="{Binding ManualEmployeeId}"
+										 Watermark="EmployeeId (ручной ввод)"
+										 MinHeight="36"/>
+
+								<ComboBox ItemsSource="{Binding Employees}"
+										  SelectedItem="{Binding SelectedEmployee}"
+										  MinHeight="36">
+									<ComboBox.ItemTemplate>
+										<DataTemplate x:DataType="models:Employee">
+											<TextBlock Text="{Binding Name, StringFormat='{}{0}'}"/>
+										</DataTemplate>
+									</ComboBox.ItemTemplate>
+								</ComboBox>
+
+								<Button Content="Подтвердить сотрудника"
+										Command="{Binding ConfirmEmployeeCommand}"
+										HorizontalContentAlignment="Center"/>
+
+								<Border Background="#FFF8E1"
+										CornerRadius="12"
+										Padding="10">
+									<TextBlock Text="{Binding ConfirmedEmployeeDisplay}"
+											   TextWrapping="Wrap"
+											   FontWeight="SemiBold"/>
+								</Border>
+
+								<Grid ColumnDefinitions="*,*" ColumnSpacing="8">
+									<Button Grid.Column="0"
+											Content="Проверить оборудование"
+											Command="{Binding CheckEquipmentCommand}"
+											HorizontalContentAlignment="Center"/>
+									<Button Grid.Column="1"
+											Content="Сохранить настройки"
+											Command="{Binding SaveDeviceSettingsCommand}"
+											HorizontalContentAlignment="Center"/>
+								</Grid>
+
+								<Button Content="Тестовый прогон"
+										Command="{Binding StartTestRunCommand}"
+										IsEnabled="{Binding CanStartTestRun}"
+										HorizontalContentAlignment="Center"/>
+
+								<Border Background="#F5F5F5"
+										CornerRadius="12"
+										Padding="10">
+									<StackPanel Spacing="4">
+										<TextBlock Text="Сводка оборудования"
+												   FontSize="13"
+												   FontWeight="SemiBold"/>
+										<TextBlock Text="{Binding EquipmentSummary}"
+												   Foreground="{Binding EquipmentSummaryColor}"
+												   FontWeight="Bold"
+												   TextWrapping="Wrap"/>
+									</StackPanel>
+								</Border>
+
+								<TextBlock Text="{Binding DeviceConfigurationPath, StringFormat='Конфиг: {0}'}"
+										   FontSize="10"
+										   TextWrapping="Wrap"/>
+								<TextBlock Text="{Binding DeviceLogPath, StringFormat='Лог: {0}'}"
+										   FontSize="10"
+										   TextWrapping="Wrap"/>
+							</StackPanel>
+						</ScrollViewer>
+
+						<Border Grid.Column="1"
+								Background="#FAFAFA"
+								CornerRadius="14"
+								Padding="14"
+								BorderBrush="#18000000"
+								BorderThickness="1"
+								MinHeight="0">
+							<Grid RowDefinitions="Auto,*" RowSpacing="10" MinHeight="0">
+								<StackPanel Spacing="4">
+									<TextBlock Text="Модули оборудования"
+											   FontSize="15"
+											   FontWeight="SemiBold"/>
+									<TextBlock Text="Карточки прокручиваются внутри панели, поэтому основной экран приложения остаётся неподвижным."
+											   FontSize="12"
+											   Opacity="0.75"
+											   TextWrapping="Wrap"/>
+								</StackPanel>
+
+								<ScrollViewer Grid.Row="1"
+										  VerticalScrollBarVisibility="Auto"
+										  HorizontalScrollBarVisibility="Disabled"
+										  MinHeight="0">
+									<ItemsControl ItemsSource="{Binding DeviceModules}">
+										<ItemsControl.ItemTemplate>
+											<DataTemplate x:DataType="devices:DeviceModuleState">
+												<Border Background="#FFFFFF"
+														CornerRadius="12"
+														Padding="12"
+														BorderBrush="#18000000"
+														BorderThickness="1"
+														Margin="0,0,0,10">
+													<Grid RowDefinitions="Auto,Auto,Auto" RowSpacing="8">
+														<Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+															<TextBlock Text="{Binding DisplayName}"
+																	   FontWeight="SemiBold"
+																	   FontSize="14"
+																	   TextWrapping="Wrap"/>
+															<Border Grid.Column="1"
+																	Background="{Binding StatusBrush}"
+																	CornerRadius="999"
+																	Padding="8,3">
+																<TextBlock Text="{Binding StatusText}"
+																		   Foreground="White"
+																		   FontSize="11"
+																		   FontWeight="Bold"/>
+															</Border>
+														</Grid>
+
+														<TextBlock Grid.Row="1"
+																   Text="{Binding StatusDetails}"
+																   FontSize="12"
+																   TextWrapping="Wrap"/>
+
+														<Grid Grid.Row="2" RowDefinitions="Auto,Auto" RowSpacing="8" MinWidth="0">
+															<Grid ColumnDefinitions="Auto,180,*" ColumnSpacing="10" MinWidth="0">
+																<CheckBox Content="Вкл"
+																		  IsChecked="{Binding IsEnabled}"
+																		  VerticalAlignment="Center"/>
+
+																<StackPanel Grid.Column="1" Spacing="4">
+																	<TextBlock Text="Режим порта"
+																			   FontSize="11"
+																			   Opacity="0.75"/>
+																	<ComboBox ItemsSource="{Binding PortModes}"
+																			  SelectedItem="{Binding PortMode}"
+																			  MinHeight="34"
+																			  MinWidth="160"/>
+																</StackPanel>
+
+																<StackPanel Grid.Column="2" Spacing="4" MinWidth="0">
+																	<TextBlock Text="COM"
+																			   FontSize="11"
+																			   Opacity="0.75"/>
+																	<TextBox Text="{Binding PortName}"
+																			 Watermark="COM"
+																			 IsEnabled="{Binding CanEditPortName}"
+																			 MinHeight="34"/>
+																</StackPanel>
+															</Grid>
+
+															<Grid Grid.Row="1" ColumnDefinitions="*,*" ColumnSpacing="10" MinWidth="0">
+																<StackPanel Grid.Column="0" Spacing="4" MinWidth="0">
+																	<TextBlock Text="Baud rate"
+																			   FontSize="11"
+																			   Opacity="0.75"/>
+																	<TextBox Text="{Binding BaudRate}"
+																			 Watermark="Baud rate"
+																			 MinHeight="34"/>
+																</StackPanel>
+
+																<StackPanel Grid.Column="1" Spacing="4" MinWidth="0">
+																	<TextBlock Text="Timeout, ms"
+																			   FontSize="11"
+																			   Opacity="0.75"/>
+																	<TextBox Text="{Binding TimeoutMs}"
+																			 Watermark="Timeout ms"
+																			 MinHeight="34"/>
+																</StackPanel>
+															</Grid>
+														</Grid>
+													</Grid>
+												</Border>
+											</DataTemplate>
+										</ItemsControl.ItemTemplate>
+									</ItemsControl>
+								</ScrollViewer>
+							</Grid>
+						</Border>
+					</Grid>
+				</Grid>
+			</Border>
+		</Grid>
+
 		<Border x:Name="Overlay"
         Grid.Row="0" Grid.Column="0"
         Grid.RowSpan="10" Grid.ColumnSpan="10"
@@ -653,7 +729,8 @@
         IsVisible="{Binding IsOverlayVisible}"
         HorizontalAlignment="Stretch"
         VerticalAlignment="Stretch"
-        IsHitTestVisible="True">
+        IsHitTestVisible="True"
+		ZIndex="100">
 			
 			
 
