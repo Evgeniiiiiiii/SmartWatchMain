@@ -21,6 +21,9 @@ obj/
 # Logs
 *.log
 
+# Local dotnet state
+.dotnet/
+
 # OS files
 .DS_Store
 Thumbs.db

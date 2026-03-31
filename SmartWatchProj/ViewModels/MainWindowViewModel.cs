@@ -20,8 +20,6 @@ using SmartWatchProj.Models;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
-using System.Drawing;
-using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
@@ -33,7 +31,6 @@ using YoloDotNet;
 using YoloDotNet.Core;
 using YoloDotNet.Extensions;
 using YoloDotNet.Models;
-using System.Text.Json;
 using Brushes = Avalonia.Media.Brushes;
 namespace SmartWatchProj.ViewModels
 {
@@ -132,9 +129,7 @@ namespace SmartWatchProj.ViewModels
             {
                 LoadEmployeesFromJson();
                 LoadMeasurementsFromJson();
-                InitializeCapture();
-                LoadYoloModel();
-                Console.WriteLine($"Инициализация успешна. Время: {DateTime.Now:dd.MM.yyyy HH:mm:ss}");
+                UpdateLastData();
                 for (int i = 0; i < 9; i++)
                 {
                     captchaLefts.Add(0);
@@ -146,6 +141,8 @@ namespace SmartWatchProj.ViewModels
                 }
                 CaptchaItems = new ObservableCollection<int>(Enumerable.Repeat(0, 9));  // Инициализация с 9 плейсхолдерами
                 isCaptchaSelected = new ObservableCollection<bool>(Enumerable.Repeat(false, 9));
+                InitializeReadinessLayer();
+                Console.WriteLine($"Инициализация успешна. Время: {DateTime.Now:dd.MM.yyyy HH:mm:ss}");
             }
             catch (Exception ex)
             {
@@ -207,10 +204,13 @@ namespace SmartWatchProj.ViewModels
         {
             try
             {
+                IsDevicePanelOpen = false;
                 ClearTopInfo();//
                 IsCollectingData = true;
                 ResultMessage = "Проверка пользователя...";
                 ResultColor = Avalonia.Media.Brushes.Black;
+                CameraMessage = string.Empty;
+                CameraMessageColor = Avalonia.Media.Brushes.Black;
                 await CheckEmployeeByCardId();
                 if (!IsEmployeeFound)
                 {
@@ -218,15 +218,18 @@ namespace SmartWatchProj.ViewModels
                     IsCollectingData = false;
                     return;
                 }
-                bool verified = await VerifyUserWithCamera();
+                bool verified = await VerifyEmployeePresenceAsync();
                 if (!verified)
                 {
                     CameraMessage = "Проверка не пройдена. Повторите.";
                     CameraMessageColor = Avalonia.Media.Brushes.Red;
                     return;
                 }
-                CameraMessage = "Пользователь верифицирован.";
-                CameraMessageColor = Avalonia.Media.Brushes.Green;
+                if (string.IsNullOrWhiteSpace(CameraMessage))
+                {
+                    CameraMessage = "Пользователь верифицирован.";
+                    CameraMessageColor = Avalonia.Media.Brushes.Green;
+                }
 
                 // Показываем оверлей и CAPTCHA
                 IsOverlayVisible = true;
@@ -392,45 +395,29 @@ namespace SmartWatchProj.ViewModels
 
         private async Task StartMeasurementProcessAsync()
         {
-            string[] instructions = new string[]
+            try
             {
-        "Подключение часов",
-        "Прислонитесь к измерителю температуры",
-        "Дуньте в алкотестер",
-        "Поместите манжету на руку",
-        "Поместите палец в глюкометр"
-            };
+                var instructions = BuildMeasurementInstructions();
+                var totalSteps = instructions.Length;
+                var stepDelayMs = GetMeasurementStepDelayMs();
 
-            int totalSteps = instructions.Length;
-            for (int i = 0; i < totalSteps; i++)
-            {
-                CurrentInstruction = instructions[i];
-                ProgressValue = (i / (double)totalSteps) * 100;
-                await Task.Delay(5000);  // Симуляция
+                for (int i = 0; i < totalSteps; i++)
+                {
+                    CurrentInstruction = instructions[i];
+                    ProgressValue = (i / (double)totalSteps) * 100;
+                    await Task.Delay(stepDelayMs);
+                }
+
+                ProgressValue = 100;
+                await Task.Delay(IsDiagnosticsModeEnabled ? 500 : 1000);
+
+                var measurement = await CaptureMeasurementAsync();
+                _measurementCompletion?.SetResult(measurement);
             }
-
-            ProgressValue = 100;
-            await Task.Delay(1000);
-
-            // Симуляция measurement
-            var random = new Random();
-            var measurement = new VitalMeasurement
+            catch (Exception ex)
             {
-                EmployeeId = currentEmployeeId,
-                Timestamp = DateTime.Now,
-                HeartRate = random.Next(50, 150),
-                Saturation = random.Next(85, 100),
-                EcgData = "simulated_ecg",
-                ActivityLevel = random.Next(1000, 3000),
-                BloodPressureSystolic = random.Next(90, 160),
-                BloodPressureDiastolic = random.Next(60, 100),
-                Temperature = 35 + random.NextDouble() * 3,
-                Glucose = 4 + random.NextDouble() * 3,
-                Cholesterol = 4 + random.NextDouble() * 3,
-                AlcoholLevel = random.NextDouble() * 1.5
-            };
-
-            _measurementCompletion?.SetResult(measurement);
+                _measurementCompletion?.SetException(ex);
+            }
         }
 
 
@@ -659,12 +646,14 @@ namespace SmartWatchProj.ViewModels
             {
                 IsEmployeeFound = true;
                 currentEmployeeId = employee.Id;
+                UpdateEmployeeStatus(employee);
                 Console.WriteLine($"Найден сотрудник ID={employee.Id}");
             }
             else
             {
                 IsEmployeeFound = false;
                 currentEmployeeId = 0;
+                UpdateEmployeeStatus();
                 Console.WriteLine($"Сотрудник с CardId={CardId} не найден");
             }
         }
@@ -993,6 +982,7 @@ namespace SmartWatchProj.ViewModels
             ResultColor = Avalonia.Media.Brushes.Black;
             CameraMessage = string.Empty;
             CameraMessageColor = Avalonia.Media.Brushes.Black;
+            UpdateEmployeeStatus();
         }
         /// <summary>
         /// Генерация отчета в PDF.
@@ -1024,15 +1014,24 @@ namespace SmartWatchProj.ViewModels
         /// </summary>
         private void InitializeCapture()
         {
-            capture = new VideoCapture(0);  // Камера 0, измените индекс если нужно
-            if (!capture.IsOpened)
+            try
             {
-                Console.WriteLine("Ошибка инициализации камеры.");
-                capture = null;
+                capture?.Dispose();
+                capture = new VideoCapture(0);  // Камера 0, измените индекс если нужно
+                if (!capture.IsOpened)
+                {
+                    Console.WriteLine("Ошибка инициализации камеры.");
+                    capture = null;
+                }
+                else
+                {
+                    Console.WriteLine("Камера инициализирована.");
+                }
             }
-            else
+            catch (Exception ex)
             {
-                Console.WriteLine("Камера инициализирована.");
+                Console.WriteLine($"Ошибка инициализации камеры: {ex.Message}");
+                capture = null;
             }
         }
 
@@ -1041,6 +1040,11 @@ namespace SmartWatchProj.ViewModels
         /// </summary>
         private void LoadYoloModel()
         {
+            if (yoloEngine != null)
+            {
+                return;
+            }
+
             var modelPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Assets", "yolov8n.onnx");
             if (!File.Exists(modelPath))
             {
@@ -1064,15 +1068,17 @@ namespace SmartWatchProj.ViewModels
         /// </summary>
         private async Task<bool> VerifyUserWithCamera()
         {
-            // Переинициализация камеры перед использованием
+            LoadYoloModel();
             InitializeCapture();
 
             if (capture == null || !capture.IsOpened)
             {
-                Console.WriteLine("Камера не инициализирована.");
+                const string message = "Камера не инициализирована или недоступна.";
+                Console.WriteLine(message);
+                LogError("Presence", message);
                 await Dispatcher.UIThread.InvokeAsync(() =>
                 {
-                    ResultMessage = "Камера не инициализирована.";
+                    ResultMessage = message;
                     ResultColor = Avalonia.Media.Brushes.Red;
                 });
                 return false;
@@ -1080,20 +1086,24 @@ namespace SmartWatchProj.ViewModels
 
             if (yoloEngine == null)
             {
-                Console.WriteLine("YOLO модель не загружена. Проверка невозможна.");
+                const string message = "YOLO модель не загружена. Проверка невозможна.";
+                Console.WriteLine(message);
+                LogError("Presence", message);
                 await Dispatcher.UIThread.InvokeAsync(() =>
                 {
-                    ResultMessage = "YOLO модель не загружена. Проверка невозможна.";
+                    ResultMessage = message;
                     ResultColor = Avalonia.Media.Brushes.Red;
                 });
                 return false;
             }
 
-            // Таймаут 30 секунд
             var start = DateTime.UtcNow;
-            var timeout = TimeSpan.FromSeconds(30);
-
-            int attempts = 0;
+            var timeout = TimeSpan.FromSeconds(20);
+            var attempts = 0;
+            var emptyFrameAttempts = 0;
+            var processingErrors = 0;
+            const int maxEmptyFrameAttempts = 12;
+            const int maxProcessingErrors = 5;
 
             await Dispatcher.UIThread.InvokeAsync(() =>
             {
@@ -1108,40 +1118,68 @@ namespace SmartWatchProj.ViewModels
                     using Mat frame = new Mat();
                     if (!capture.Read(frame) || frame.IsEmpty)
                     {
-                        Console.WriteLine("Пустой кадр, пропуск...");
+                        emptyFrameAttempts++;
                         attempts++;
-                        await Task.Delay(100);
+
+                        if (emptyFrameAttempts >= maxEmptyFrameAttempts)
+                        {
+                            const string noFrameMessage = "Камера открыта, но не отдаёт кадр. Проверка остановлена.";
+                            Console.WriteLine(noFrameMessage);
+                            LogError("Presence", noFrameMessage);
+                            await Dispatcher.UIThread.InvokeAsync(() =>
+                            {
+                                ResultMessage = noFrameMessage;
+                                ResultColor = Avalonia.Media.Brushes.Red;
+                            });
+                            return false;
+                        }
+
+                        await Task.Delay(120);
                         continue;
                     }
 
-                    // Emgu.CV -> JPEG bytes (как у тебя: через VectorOfByte)
+                    emptyFrameAttempts = 0;
+
                     using VectorOfByte vec = new VectorOfByte();
                     CvInvoke.Imencode(".jpg", frame, vec);
                     byte[] jpegData = vec.ToArray();
 
-                    using SKBitmap skBitmap = SKBitmap.Decode(jpegData);
-
-                    // YOLO детекция
-                    var results = yoloEngine.RunObjectDetection(skBitmap, confidence: 0.5, iou: 0.45);
-
-                    // Фильтр только person
-                    var personResults = results.Where(r => r.Label.Name == "person").ToList();
-                    int personCount = personResults.Count(r => r.Confidence > 0.5);
-
-                    // Рисуем bounding boxes только вокруг person
-                    skBitmap.Draw(personResults);
-
-                    Console.WriteLine($"Attempt {attempts}: Persons detected: {personCount}");
-
-                    // Кодируем модифицированный skBitmap обратно в jpeg для UI
-                    using (MemoryStream modifiedMs = new MemoryStream())
+                    var decodedBitmap = SKBitmap.Decode(jpegData);
+                    if (decodedBitmap is null)
                     {
-                        skBitmap.Encode(modifiedMs, SKEncodedImageFormat.Jpeg, 100);
+                        processingErrors++;
+                        if (processingErrors >= maxProcessingErrors)
+                        {
+                            const string decodeMessage = "Не удалось декодировать кадр камеры для проверки присутствия.";
+                            LogError("Presence", decodeMessage);
+                            await Dispatcher.UIThread.InvokeAsync(() =>
+                            {
+                                ResultMessage = decodeMessage;
+                                ResultColor = Avalonia.Media.Brushes.Red;
+                            });
+                            return false;
+                        }
+
+                        await Task.Delay(120);
+                        continue;
+                    }
+
+                    using (decodedBitmap)
+                    {
+                        var results = yoloEngine.RunObjectDetection(decodedBitmap, confidence: 0.5, iou: 0.45);
+                        processingErrors = 0;
+
+                        var personResults = results.Where(r => r.Label.Name == "person").ToList();
+                        int personCount = personResults.Count(r => r.Confidence > 0.5);
+
+                        decodedBitmap.Draw(personResults);
+                        Console.WriteLine($"Attempt {attempts}: Persons detected: {personCount}");
+
+                        using MemoryStream modifiedMs = new MemoryStream();
+                        decodedBitmap.Encode(modifiedMs, SKEncodedImageFormat.Jpeg, 100);
                         modifiedMs.Seek(0, SeekOrigin.Begin);
 
                         var avaloniaBitmap = new Avalonia.Media.Imaging.Bitmap(modifiedMs);
-
-                        // Обновляем превью + пишем сообщение в панель информации (ResultMessage)
                         await Dispatcher.UIThread.InvokeAsync(() =>
                         {
                             CameraFrame = avaloniaBitmap;
@@ -1162,17 +1200,33 @@ namespace SmartWatchProj.ViewModels
                                 ResultColor = Avalonia.Media.Brushes.Red;
                             }
                         });
+
+                        if (personCount == 1)
+                        {
+                            LogInfo("Presence", "Presence verified by camera and YOLO.");
+                            return true;
+                        }
                     }
 
-                    if (personCount == 1)
-                        return true;
-
                     attempts++;
-                    await Task.Delay(100);
+                    await Task.Delay(120);
                 }
                 catch (Exception ex)
                 {
+                    processingErrors++;
                     Console.WriteLine($"Ошибка в VerifyUserWithCamera: {ex.Message}. Stack: {ex.StackTrace}");
+
+                    if (processingErrors >= maxProcessingErrors)
+                    {
+                        var fatalMessage = $"Ошибка обработки камеры/YOLO: {ex.Message}";
+                        LogError("Presence", fatalMessage);
+                        await Dispatcher.UIThread.InvokeAsync(() =>
+                        {
+                            ResultMessage = fatalMessage;
+                            ResultColor = Avalonia.Media.Brushes.Red;
+                        });
+                        return false;
+                    }
 
                     await Dispatcher.UIThread.InvokeAsync(() =>
                     {
@@ -1180,21 +1234,20 @@ namespace SmartWatchProj.ViewModels
                         ResultColor = Avalonia.Media.Brushes.Orange;
                     });
 
-                    await Task.Delay(100);
+                    await Task.Delay(120);
                 }
             }
 
-            // Таймаут
+            const string timeoutMessage = "Проверка завершена: за 20 секунд не удалось подтвердить присутствие одного человека.";
+            LogWarning("Presence", timeoutMessage);
             await Dispatcher.UIThread.InvokeAsync(() =>
             {
-                ResultMessage = "Проверка завершена: за 30 секунд не удалось получить кадр с 1 человеком.";
+                ResultMessage = timeoutMessage;
                 ResultColor = Avalonia.Media.Brushes.Red;
             });
 
             return false;
         }
-
-
 
         /// <summary>
         /// Конвертер Mat в Avalonia Bitmap (с использованием временного файла).
@@ -1331,3 +1384,4 @@ namespace SmartWatchProj.ViewModels
         }
     }
 }
+
