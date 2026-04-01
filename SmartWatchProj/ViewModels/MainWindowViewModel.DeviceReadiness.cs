@@ -127,6 +127,7 @@ namespace SmartWatchProj.ViewModels
                 var snapshots = RefreshHardwareState();
                 LogHardwareSnapshots(snapshots);
                 LogInfo("Preflight", PreflightSummary);
+                LogInfo("Preflight", "Проверка оборудования завершена. Presence-check и основной сценарий не запускались.");
             }
             catch (Exception ex)
             {

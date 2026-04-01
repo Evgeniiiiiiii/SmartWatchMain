@@ -7,10 +7,12 @@ namespace SmartWatchProj.Models.Devices
         public string Id { get; init; } = string.Empty;
         public string DisplayName { get; init; } = string.Empty;
         public string Detail { get; init; } = string.Empty;
+        public string? StatusLabel { get; init; }
+        public string? BlockingLabel { get; init; }
         public DeviceReadinessState State { get; init; }
         public bool IsBlocking { get; init; }
 
-        public string StateText => State switch
+        public string StateText => StatusLabel ?? (State switch
         {
             DeviceReadinessState.Ready => "Готово",
             DeviceReadinessState.Warning => "Не готово",
@@ -21,7 +23,7 @@ namespace SmartWatchProj.Models.Devices
             DeviceReadinessState.Skipped => "Пропущено",
             DeviceReadinessState.Disabled => "Отключено",
             _ => "Не проверено"
-        };
+        });
 
         public IBrush AccentBrush => State switch
         {
@@ -36,7 +38,7 @@ namespace SmartWatchProj.Models.Devices
             _ => Brushes.DimGray
         };
 
-        public string BlockingText => IsBlocking
+        public string BlockingText => BlockingLabel ?? (IsBlocking
             ? "Блокирует реальный запуск"
             : State switch
             {
@@ -44,6 +46,6 @@ namespace SmartWatchProj.Models.Devices
                 DeviceReadinessState.Skipped => "Проверка пропущена",
                 DeviceReadinessState.Disabled => "Проверка отключена",
                 _ => "Не блокирует diagnostics"
-            };
+            });
     }
 }

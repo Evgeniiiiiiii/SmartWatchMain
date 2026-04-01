@@ -1,0 +1,35 @@
+{
+  "modules": {
+    "watch": {
+      "port": "COM3",
+      "smokeProtocol": "serial-text",
+      "baudRate": 9600,
+      "message": "PING",
+      "timeoutMs": 1500,
+      "readLine": false,
+      "rawWrite": false,
+      "newLine": "\\n",
+      "expectedResponseContains": "OK"
+    },
+    "breathalyzer": {
+      "port": "COM4",
+      "smokeProtocol": "serial-text",
+      "baudRate": 9600,
+      "message": "PING",
+      "timeoutMs": 1500,
+      "readLine": false,
+      "rawWrite": false,
+      "newLine": "\\n",
+      "expectedResponseContains": "BREATH"
+    },
+    "thermometer": {
+      "port": ""
+    },
+    "blood-pressure": {
+      "port": ""
+    },
+    "glucose-meter": {
+      "port": ""
+    }
+  }
+}
