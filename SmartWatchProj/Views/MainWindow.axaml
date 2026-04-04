@@ -13,6 +13,8 @@
         x:DataType="vm:MainWindowViewModel"
         Icon="/Assets/avalonia-logo.ico"
         Title="SmartWatchProj"
+        FontFamily="Inter, DejaVu Sans, Arial"
+        UseLayoutRounding="True"
         MinWidth="1000" MinHeight="600"
         WindowState="FullScreen">
 
@@ -95,11 +97,7 @@
 			<Setter Property="Foreground" Value="#FF6D00" />
 		</Style>
 	</Window.Styles>
-	<Viewbox Stretch="Uniform"
-         StretchDirection="DownOnly"
-         HorizontalAlignment="Stretch"
-         VerticalAlignment="Stretch">
-	<Grid Width="1920" Height="1080">
+    <Grid>
     <Grid Margin="20">
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="*" />
@@ -128,6 +126,7 @@
 		<!-- Левая панель: Ввод и управление (ровная колонка + сообщения) -->
 		<Border Grid.Row="0"
 				Grid.Column="2"
+				IsVisible="{Binding !IsDevicePanelOpen}"
 				Background="#FFF8F2"
 				CornerRadius="16"
 				Padding="14,12"
@@ -195,16 +194,33 @@
 
 			<Button Content="Симулировать пропуск"
 					Command="{Binding SimulateCardReadCommand}"
+					IsEnabled="{Binding IsSimulationEnabled}"
 					Width="260"
 					HorizontalAlignment="Center"
 					HorizontalContentAlignment="Center"/>
 
 			<Button Content="Старт"
 					Command="{Binding StartCommand}"
-					IsEnabled="{Binding IsEmployeeFound}"
+					IsEnabled="{Binding CanStartWorkflow}"
 					Width="260"
 					HorizontalAlignment="Center"
 					HorizontalContentAlignment="Center"/>
+
+			<TextBlock Text="{Binding StartAvailabilityReason}"
+					   IsVisible="{Binding !CanStartWorkflow}"
+					   Width="260"
+					   TextWrapping="Wrap"
+					   FontSize="12"
+					   Foreground="#7A1F1F"
+					   TextAlignment="Center"/>
+
+			<Button Content="Экстренная остановка"
+					Command="{Binding EmergencyStopCommand}"
+					IsEnabled="{Binding CanEmergencyStop}"
+					Width="260"
+					HorizontalAlignment="Center"
+					HorizontalContentAlignment="Center"
+					Background="#C62828"/>
 
 			<ProgressBar IsIndeterminate="{Binding IsCollectingData}"
 						 Height="18"
@@ -212,7 +228,23 @@
 						 Margin="0,8,0,0"
 						 HorizontalAlignment="Center"/>
 
+			<TextBlock Text="{Binding HardwareSafetyStatus}"
+					   Width="260"
+					   TextWrapping="Wrap"
+					   FontSize="12"
+					   FontWeight="SemiBold"
+					   Foreground="#7A1F1F"
+					   TextAlignment="Center"/>
+
 			<!-- ВЕРХНЯЯ панель: только ошибки от кнопок/ввода -->
+			<TextBlock Text="{Binding CameraModeStatusText}"
+					   IsVisible="{Binding IsNoCameraModeEnabled}"
+					   Width="260"
+					   TextWrapping="Wrap"
+					   FontSize="12"
+					   Foreground="#7A1F1F"
+					   TextAlignment="Center"/>
+
 			<Border IsVisible="{Binding IsTopInfoVisible}"
 					Background="#FFFFFF"
 					CornerRadius="14"
@@ -256,10 +288,12 @@
 							   Opacity="0.85"/>
 
 					<CheckBox Content="Diagnostics mode"
-							  IsChecked="{Binding IsDiagnosticsModeEnabled}"/>
+							  IsChecked="{Binding IsDiagnosticsModeEnabled}"
+							  IsEnabled="{Binding AreDiagnosticsControlsEnabled}"/>
 
 					<CheckBox Content="Пробовать камеру в diagnostics"
-							  IsChecked="{Binding PreferCameraVerificationInDiagnostics}"/>
+							  IsChecked="{Binding PreferCameraVerificationInDiagnostics}"
+							  IsEnabled="{Binding AreDiagnosticsControlsEnabled}"/>
 
 					<TextBlock Text="{Binding EmployeeStatusText}"
 							   FontSize="12"
@@ -276,6 +310,7 @@
 
 					<Button Content="Тестовый прогон"
 							Command="{Binding RunTestRunCommand}"
+							IsEnabled="{Binding AreDiagnosticsControlsEnabled}"
 							HorizontalContentAlignment="Center"/>
 
 					<ScrollViewer MaxHeight="165">
@@ -584,21 +619,28 @@
         <!-- Кнопка выхода: Внизу справа, не наезжает -->
 		<Button Grid.Row="4" Grid.Column="2" Content="Завершить и выйти" Command="{Binding FinishAndExitCommand}" Width="200" HorizontalContentAlignment="Center" Margin="0,0,10,0" HorizontalAlignment="Right" VerticalAlignment="Bottom" Padding="16,8" />
 
-	</Grid>
+    </Grid>
 
 		<Border IsVisible="{Binding IsDevicePanelOpen}"
-				Background="#58000000"
+				Background="#70000000"
 				HorizontalAlignment="Stretch"
-				VerticalAlignment="Stretch">
-			<Grid ColumnDefinitions="*,440"
-				  HorizontalAlignment="Stretch"
-				  VerticalAlignment="Stretch">
-				<Border Grid.Column="1"
-						Background="#FFFDF9"
+				VerticalAlignment="Stretch"
+				ZIndex="20">
+			<Grid HorizontalAlignment="Stretch"
+				  VerticalAlignment="Stretch"
+				  Margin="32">
+				<Border Background="#FFFDF9"
 						BorderBrush="#22000000"
-						BorderThickness="1,0,0,0"
-						BoxShadow="-16 0 30 0 #24000000"
-						Padding="24,22">
+						BorderThickness="1"
+						CornerRadius="20"
+						BoxShadow="0 24 56 0 #30000000"
+						Padding="24,22"
+						HorizontalAlignment="Center"
+						VerticalAlignment="Center"
+						Width="820"
+						MaxWidth="900"
+						MaxHeight="920"
+						MinHeight="520">
 					<Grid RowDefinitions="Auto,Auto,*,Auto"
 						  RowSpacing="16">
 						<Grid ColumnDefinitions="*,Auto"
@@ -628,13 +670,20 @@
 								BorderBrush="#12000000"
 								BorderThickness="1">
 							<StackPanel Spacing="8">
+								<TextBlock Text="{Binding StartBlockingSummary}"
+										   FontSize="13"
+										   FontWeight="SemiBold"
+										   TextWrapping="Wrap"
+										   Foreground="#8A2C0A"/>
 								<TextBlock Text="{Binding RunModeText}"
 										   FontSize="12"
 										   TextWrapping="Wrap"/>
 								<CheckBox Content="Diagnostics mode"
-										  IsChecked="{Binding IsDiagnosticsModeEnabled}"/>
+										  IsChecked="{Binding IsDiagnosticsModeEnabled}"
+										  IsEnabled="{Binding AreDiagnosticsControlsEnabled}"/>
 								<CheckBox Content="Пробовать камеру в diagnostics"
-										  IsChecked="{Binding PreferCameraVerificationInDiagnostics}"/>
+										  IsChecked="{Binding PreferCameraVerificationInDiagnostics}"
+										  IsEnabled="{Binding AreDiagnosticsControlsEnabled}"/>
 								<TextBlock Text="{Binding EmployeeStatusText}"
 										   FontSize="12"
 										   TextWrapping="Wrap"/>
@@ -646,7 +695,9 @@
 						</Border>
 
 						<ScrollViewer Grid.Row="2"
-									  VerticalScrollBarVisibility="Auto">
+									  VerticalScrollBarVisibility="Visible"
+									  HorizontalScrollBarVisibility="Disabled"
+									  AllowAutoHide="False">
 							<StackPanel Spacing="12">
 								<Grid ColumnDefinitions="*,*"
 									  ColumnSpacing="10">
@@ -656,44 +707,56 @@
 									<Button Grid.Column="1"
 											Content="Тестовый прогон"
 											Command="{Binding RunTestRunCommand}"
+											IsEnabled="{Binding AreDiagnosticsControlsEnabled}"
 											HorizontalContentAlignment="Center"/>
 								</Grid>
 
-								<ItemsControl ItemsSource="{Binding DeviceStatuses}">
-									<ItemsControl.ItemTemplate>
-										<DataTemplate x:DataType="devices:DeviceStatusSnapshot">
-											<Border BorderBrush="{Binding AccentBrush}"
-													BorderThickness="1"
-													CornerRadius="12"
-													Background="White"
-													Padding="10"
-													Margin="0,0,0,8">
-												<StackPanel Spacing="4">
-													<DockPanel>
-														<TextBlock DockPanel.Dock="Right"
-																   Text="{Binding StateText}"
-																   Foreground="{Binding AccentBrush}"
-																   FontWeight="SemiBold"
-																   HorizontalAlignment="Right"/>
-														<TextBlock Text="{Binding DisplayName}"
-																   FontWeight="SemiBold"
-																   TextWrapping="Wrap"/>
-													</DockPanel>
+								<Border Background="#FFFFFF"
+										CornerRadius="12"
+										Padding="12"
+										BorderBrush="#15000000"
+										BorderThickness="1">
+									<StackPanel Spacing="8">
+										<TextBlock Text="Статусы оборудования"
+												   FontSize="12"
+												   FontWeight="SemiBold"/>
+										<ItemsControl ItemsSource="{Binding DeviceStatuses}">
+											<ItemsControl.ItemTemplate>
+												<DataTemplate x:DataType="devices:DeviceStatusSnapshot">
+													<Border BorderBrush="{Binding AccentBrush}"
+															BorderThickness="1"
+															CornerRadius="12"
+															Background="White"
+															Padding="10"
+															Margin="0,0,0,8">
+														<StackPanel Spacing="4">
+															<DockPanel>
+																<TextBlock DockPanel.Dock="Right"
+																		   Text="{Binding StateText}"
+																		   Foreground="{Binding AccentBrush}"
+																		   FontWeight="SemiBold"
+																		   HorizontalAlignment="Right"/>
+																<TextBlock Text="{Binding DisplayName}"
+																		   FontWeight="SemiBold"
+																		   TextWrapping="Wrap"/>
+															</DockPanel>
 
-													<TextBlock Text="{Binding Detail}"
-															   FontSize="11"
-															   TextWrapping="Wrap"
-															   Opacity="0.82"/>
+															<TextBlock Text="{Binding Detail}"
+																	   FontSize="11"
+																	   TextWrapping="Wrap"
+																	   Opacity="0.82"/>
 
-													<TextBlock Text="{Binding BlockingText}"
-															   FontSize="10"
-															   Foreground="{Binding AccentBrush}"
-															   Opacity="0.85"/>
-												</StackPanel>
-											</Border>
-										</DataTemplate>
-									</ItemsControl.ItemTemplate>
-								</ItemsControl>
+															<TextBlock Text="{Binding BlockingText}"
+																	   FontSize="10"
+																	   Foreground="{Binding AccentBrush}"
+																	   Opacity="0.85"/>
+														</StackPanel>
+													</Border>
+												</DataTemplate>
+											</ItemsControl.ItemTemplate>
+										</ItemsControl>
+									</StackPanel>
+								</Border>
 
 								<Border Background="#FFFFFF"
 										CornerRadius="12"
@@ -747,13 +810,12 @@
 		</Border>
 
 		<Border x:Name="Overlay"
-        Grid.Row="0" Grid.Column="0"
-        Grid.RowSpan="10" Grid.ColumnSpan="10"
         Background="#80000000"
         IsVisible="{Binding IsOverlayVisible}"
         HorizontalAlignment="Stretch"
         VerticalAlignment="Stretch"
-        IsHitTestVisible="True">
+        IsHitTestVisible="True"
+        ZIndex="30">
 			
 			
 
@@ -893,15 +955,25 @@
 								</LinearGradientBrush>
 							</ProgressBar.Foreground>
 						</ProgressBar>
+
+						<Button Content="Экстренная остановка"
+								Command="{Binding EmergencyStopCommand}"
+								IsEnabled="{Binding CanEmergencyStop}"
+								HorizontalAlignment="Center"
+								Width="220"
+								Background="#B71C1C"/>
+
+						<TextBlock Text="{Binding HardwareSafetyStatus}"
+								   FontSize="13"
+								   FontWeight="SemiBold"
+								   TextAlignment="Center"
+								   TextWrapping="Wrap"
+								   Foreground="#7A1F1F"/>
 					</StackPanel>
 				</Border>
 
 
 			</StackPanel>
 		</Border>
-	
-	
-	
-	</Grid>
-	</Viewbox>
+    </Grid>
 </Window>

@@ -3,12 +3,16 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Ports;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using System.Threading;
 using Emgu.CV;
-using Emgu.CV.Util;
+using Emgu.CV.CvEnum;
 using SkiaSharp;
 using SmartWatchProj.Models.Devices;
+using SmartWatchProj.Services.Diagnostics;
 using YoloDotNet;
 using YoloDotNet.Core;
 using YoloDotNet.Models;
@@ -18,71 +22,148 @@ namespace SmartWatchProj.Services.Devices
     public sealed class DevicePreflightService
     {
         private const int CameraIndex = 0;
+        private const string LinuxPrimaryVideoDevice = "/dev/video0";
+        private const string ConfigFileName = "device-port-map.json";
         private readonly string baseDirectory;
+        private readonly RuntimeLogStore logStore;
 
-        public DevicePreflightService(string baseDirectory)
+        public DevicePreflightService(string baseDirectory, RuntimeLogStore logStore)
         {
             this.baseDirectory = baseDirectory;
+            this.logStore = logStore;
         }
 
-        public IReadOnlyList<DeviceStatusSnapshot> Check(bool diagnosticsMode)
+        public IReadOnlyList<DeviceStatusSnapshot> Check(bool diagnosticsMode, CancellationToken cancellationToken = default)
         {
+            var config = TryLoadConfig();
+            var controller = config.Controller;
             var serialReport = ProbeSerialPorts();
-            var comPlans = BuildComModulePlans(serialReport);
-            var cameraProbe = ProbeCamera(diagnosticsMode);
+            var controllerProbe = ProbeController(controller, cancellationToken);
+            var noCameraMode = OperatingSystem.IsLinux() && config.LinuxNoCameraMode;
+            var cameraProbe = noCameraMode
+                ? new CameraProbeResult(BuildCameraDisabledStatus())
+                : ProbeCamera(config.CameraRotation);
+            var yoloStatus = noCameraMode
+                ? BuildYoloDisabledStatus()
+                : ProbeYoloModel(cameraProbe, diagnosticsMode);
 
-            var statuses = new List<DeviceStatusSnapshot>
+            if (noCameraMode)
+            {
+                logStore.Warning("Mode", "Linux no-camera mode enabled");
+                logStore.Warning("Presence", "Camera stage bypassed by config");
+            }
+
+            return new List<DeviceStatusSnapshot>
             {
                 cameraProbe.Status,
-                ProbeYoloModel(cameraProbe, diagnosticsMode),
-                ProbeComEnvironment(serialReport, comPlans)
+                yoloStatus,
+                ProbeComEnvironment(serialReport, controller),
+                BuildControllerConnectionStatus(serialReport, controller, controllerProbe, diagnosticsMode),
+                BuildControllerCommandStatus(controller, controllerProbe, diagnosticsMode),
+                BuildControllerDataStatus(controllerProbe)
             };
-
-            statuses.AddRange(comPlans.Select(plan => BuildPeripheralStatus(diagnosticsMode, serialReport, plan)));
-            return statuses;
         }
 
-        private CameraProbeResult ProbeCamera(bool diagnosticsMode)
+        private static DeviceStatusSnapshot BuildCameraDisabledStatus() =>
+            new()
+            {
+                Id = "camera",
+                DisplayName = "Камера",
+                State = DeviceReadinessState.Disabled,
+                StatusLabel = "Отключено для Linux test mode",
+                Detail = "Камера отключена для текущего Linux test режима и не участвует в preflight/runtime.",
+                IsBlocking = false,
+                BlockingLabel = "Камера отключена конфигом"
+            };
+
+        private static DeviceStatusSnapshot BuildYoloDisabledStatus() =>
+            new()
+            {
+                Id = "yolo",
+                DisplayName = "YOLO / presence",
+                State = DeviceReadinessState.Disabled,
+                StatusLabel = "Отключено для Linux test mode",
+                Detail = "Presence/YOLO отключены вместе с камерой для текущего Linux test режима.",
+                IsBlocking = false,
+                BlockingLabel = "Presence отключен конфигом"
+            };
+
+        private CameraProbeResult ProbeCamera(int cameraRotation)
         {
+            var linuxDevices = GetLinuxVideoDevices();
+            var selectedDevice = GetPrimaryLinuxVideoDevice(linuxDevices);
+            var permissionNote = GetLinuxCameraPermissionNote();
+
+            if (OperatingSystem.IsLinux() && selectedDevice is null)
+            {
+                return new CameraProbeResult(new DeviceStatusSnapshot
+                {
+                    Id = "camera",
+                    DisplayName = "Камера",
+                    State = DeviceReadinessState.Unavailable,
+                    StatusLabel = "Камера не найдена",
+                    Detail = $"Ожидался основной video device {LinuxPrimaryVideoDevice}. Обнаружено: {(linuxDevices.Count == 0 ? "нет video-устройств" : string.Join(", ", linuxDevices))}.",
+                    IsBlocking = false,
+                    BlockingLabel = "Блокирует реальный запуск: камера отсутствует"
+                });
+            }
+
             try
             {
-                using var probe = new VideoCapture(CameraIndex);
+                using var probe = OperatingSystem.IsLinux()
+                    ? new VideoCapture(CameraIndex, VideoCapture.API.V4L2)
+                    : new VideoCapture(CameraIndex);
+
                 if (!probe.IsOpened)
                 {
                     return new CameraProbeResult(new DeviceStatusSnapshot
                     {
                         Id = "camera",
                         DisplayName = "Камера",
-                        State = DeviceReadinessState.Missing,
-                        Detail = $"Камера с индексом {CameraIndex} не открылась.",
-                        IsBlocking = !diagnosticsMode
+                        State = permissionNote is null ? DeviceReadinessState.Error : DeviceReadinessState.Unavailable,
+                        StatusLabel = permissionNote is null ? "Camera open failed" : "Нет прав к камере",
+                        Detail = $"Не удалось открыть {(selectedDevice ?? LinuxPrimaryVideoDevice)} через {(OperatingSystem.IsLinux() ? "V4L2" : "default backend")}. {BuildCameraEnvironmentDetail(linuxDevices, selectedDevice, permissionNote)}",
+                        IsBlocking = false,
+                        BlockingLabel = "Блокирует реальный запуск: камера не открывается"
                     });
                 }
 
                 using var frame = new Mat();
                 for (var attempt = 1; attempt <= 4; attempt++)
                 {
-                    if (probe.Read(frame) && !frame.IsEmpty)
+                    if (!probe.Read(frame) || frame.IsEmpty)
                     {
-                        using var buffer = new VectorOfByte();
-                        CvInvoke.Imencode(".jpg", frame, buffer);
-                        var frameBytes = buffer.ToArray();
-                        if (frameBytes.Length > 0)
-                        {
-                            return new CameraProbeResult(
-                                new DeviceStatusSnapshot
-                                {
-                                    Id = "camera",
-                                    DisplayName = "Камера",
-                                    State = DeviceReadinessState.Ready,
-                                    Detail = $"Камера {CameraIndex} открылась и отдала кадр (попытка {attempt}).",
-                                    IsBlocking = false
-                                },
-                                frameBytes);
-                        }
+                        Thread.Sleep(150);
+                        continue;
                     }
 
-                    Thread.Sleep(150);
+                    using var skBitmap = TryConvertMatToSkBitmap(frame);
+                    if (skBitmap is null)
+                    {
+                        return new CameraProbeResult(new DeviceStatusSnapshot
+                        {
+                            Id = "camera",
+                            DisplayName = "Камера",
+                            State = DeviceReadinessState.Error,
+                            StatusLabel = "Ошибка обработки кадра",
+                            Detail = $"Камера открылась, но кадр не удалось преобразовать без OpenCV encode path. {BuildCameraEnvironmentDetail(linuxDevices, selectedDevice, permissionNote)}",
+                            IsBlocking = false,
+                            BlockingLabel = "Блокирует реальный запуск: кадр камеры не обрабатывается"
+                        });
+                    }
+
+                    using var rotatedBitmap = ApplyCameraRotation(skBitmap, cameraRotation);
+                    using var image = SKImage.FromBitmap(rotatedBitmap);
+                    using var data = image.Encode(SKEncodedImageFormat.Jpeg, 90);
+                    return new CameraProbeResult(new DeviceStatusSnapshot
+                    {
+                        Id = "camera",
+                        DisplayName = "Камера",
+                        State = DeviceReadinessState.Ready,
+                        StatusLabel = "Кадр получен",
+                        Detail = $"Устройство {(selectedDevice ?? $"index {CameraIndex}")}, backend {(OperatingSystem.IsLinux() ? "V4L2" : "default")}, первый кадр получен ({frame.Width}x{frame.Height}, попытка {attempt}). {BuildCameraEnvironmentDetail(linuxDevices, selectedDevice, permissionNote)}",
+                        IsBlocking = false
+                    }, data.ToArray());
                 }
 
                 return new CameraProbeResult(new DeviceStatusSnapshot
@@ -90,34 +171,43 @@ namespace SmartWatchProj.Services.Devices
                     Id = "camera",
                     DisplayName = "Камера",
                     State = DeviceReadinessState.Unavailable,
-                    Detail = $"Камера {CameraIndex} открылась, но ни один кадр не был получен.",
-                    IsBlocking = !diagnosticsMode
+                    StatusLabel = "Кадр не получен",
+                    Detail = $"Камера открылась, но за 4 попытки не отдала кадр. {BuildCameraEnvironmentDetail(linuxDevices, selectedDevice, permissionNote)}",
+                    IsBlocking = false,
+                    BlockingLabel = "Блокирует реальный запуск: камера не отдаёт кадр"
                 });
             }
             catch (Exception ex)
             {
+                var permissionRelated = IsPermissionError(ex);
                 return new CameraProbeResult(new DeviceStatusSnapshot
                 {
                     Id = "camera",
                     DisplayName = "Камера",
-                    State = DeviceReadinessState.Error,
-                    Detail = $"Ошибка открытия камеры {CameraIndex}: {ex.Message}",
-                    IsBlocking = !diagnosticsMode
+                    State = permissionRelated ? DeviceReadinessState.Unavailable : DeviceReadinessState.Error,
+                    StatusLabel = permissionRelated ? "Нет прав к камере" : "Camera open failed",
+                    Detail = $"Ошибка открытия {(selectedDevice ?? LinuxPrimaryVideoDevice)}: {ex.Message}. {BuildCameraEnvironmentDetail(linuxDevices, selectedDevice, permissionNote)}",
+                    IsBlocking = false,
+                    BlockingLabel = permissionRelated
+                        ? "Блокирует реальный запуск: недостаточно прав к камере"
+                        : "Блокирует реальный запуск: ошибка открытия камеры"
                 });
             }
         }
 
         private DeviceStatusSnapshot ProbeYoloModel(CameraProbeResult cameraProbe, bool diagnosticsMode)
         {
-            if (cameraProbe.Status.State != DeviceReadinessState.Ready || cameraProbe.FrameBytes is null || cameraProbe.FrameBytes.Length == 0)
+            if (cameraProbe.SampleFrameBytes is null)
             {
                 return new DeviceStatusSnapshot
                 {
                     Id = "yolo",
-                    DisplayName = "YOLO / модель присутствия",
+                    DisplayName = "YOLO / presence",
                     State = DeviceReadinessState.Skipped,
-                    Detail = $"Проверка пропущена: камера не подтверждена ({cameraProbe.Status.StateText.ToLowerInvariant()}).",
-                    IsBlocking = false
+                    StatusLabel = "Пропущено из-за камеры",
+                    Detail = $"YOLO skipped because camera state is {cameraProbe.Status.StateText}.",
+                    IsBlocking = false,
+                    BlockingLabel = "Блокирует реальный запуск: YOLO не может стартовать без кадра"
                 };
             }
 
@@ -127,646 +217,660 @@ namespace SmartWatchProj.Services.Devices
                 return new DeviceStatusSnapshot
                 {
                     Id = "yolo",
-                    DisplayName = "YOLO / модель присутствия",
+                    DisplayName = "YOLO / presence",
                     State = DeviceReadinessState.Missing,
-                    Detail = $"Файл модели не найден: {modelPath}",
-                    IsBlocking = !diagnosticsMode
+                    StatusLabel = "Модель не найдена",
+                    Detail = $"Файл модели отсутствует: {modelPath}.",
+                    IsBlocking = false,
+                    BlockingLabel = "Блокирует реальный запуск: отсутствует YOLO-модель"
                 };
             }
 
             try
             {
-                var skBitmap = SKBitmap.Decode(cameraProbe.FrameBytes);
-                if (skBitmap is null)
+                using var bitmap = SKBitmap.Decode(cameraProbe.SampleFrameBytes);
+                using var yolo = new Yolo(new YoloOptions
                 {
-                    return new DeviceStatusSnapshot
-                    {
-                        Id = "yolo",
-                        DisplayName = "YOLO / модель присутствия",
-                        State = DeviceReadinessState.Error,
-                        Detail = "Тестовый кадр камеры не удалось декодировать для проверки YOLO.",
-                        IsBlocking = !diagnosticsMode
-                    };
-                }
+                    OnnxModel = modelPath,
+                    ExecutionProvider = new CpuExecutionProvider()
+                });
 
-                using (skBitmap)
+                var detections = yolo.RunObjectDetection(bitmap, confidence: 0.2, iou: 0.4);
+                var personDetected = detections.Any(item => string.Equals(item.Label.Name, "person", StringComparison.OrdinalIgnoreCase));
+                var labelSummary = detections.Count == 0
+                    ? "объекты не обнаружены"
+                    : string.Join(", ", detections.Take(5).Select(item => $"{item.Label.Name}:{item.Confidence:0.00}"));
+
+                return new DeviceStatusSnapshot
                 {
-                    var probe = new Yolo(new YoloOptions
-                    {
-                        OnnxModel = modelPath,
-                        ExecutionProvider = new CpuExecutionProvider()
-                    });
-
-                    try
-                    {
-                        var results = probe.RunObjectDetection(skBitmap, confidence: 0.5, iou: 0.45);
-                        var personCount = results.Count(result =>
-                            string.Equals(result.Label.Name, "person", StringComparison.OrdinalIgnoreCase)
-                            && result.Confidence > 0.5);
-
-                        return new DeviceStatusSnapshot
-                        {
-                            Id = "yolo",
-                            DisplayName = "YOLO / модель присутствия",
-                            State = DeviceReadinessState.Ready,
-                            Detail = $"Модель загружена и выполнила инференс на тестовом кадре. Обнаружено person: {personCount}.",
-                            IsBlocking = false
-                        };
-                    }
-                    finally
-                    {
-                        if (probe is IDisposable disposable)
-                        {
-                            disposable.Dispose();
-                        }
-                    }
-                }
+                    Id = "yolo",
+                    DisplayName = "YOLO / presence",
+                    State = DeviceReadinessState.Ready,
+                    StatusLabel = personDetected ? "Person detected" : "Инференс выполнен",
+                    Detail = $"Модель загружена, инференс выполнен по кадру камеры. Результат: {labelSummary}.",
+                    IsBlocking = false
+                };
             }
             catch (Exception ex)
             {
                 return new DeviceStatusSnapshot
                 {
                     Id = "yolo",
-                    DisplayName = "YOLO / модель присутствия",
+                    DisplayName = "YOLO / presence",
                     State = DeviceReadinessState.Error,
-                    Detail = $"Ошибка проверки YOLO: {ex.Message}",
-                    IsBlocking = !diagnosticsMode
+                    StatusLabel = "Ошибка инференса",
+                    Detail = $"Не удалось выполнить YOLO inference: {ex.Message}",
+                    IsBlocking = false,
+                    BlockingLabel = "Блокирует реальный запуск: YOLO не запускается"
                 };
             }
         }
 
-        private static DeviceStatusSnapshot ProbeComEnvironment(
-            SerialPortProbeReport report,
-            IReadOnlyList<ComModuleProbePlan> plans)
+        private DeviceStatusSnapshot ProbeComEnvironment(SerialPortProbeReport report, Esp32ControllerConfig? controller)
         {
-            if (report.ProbeError is not null)
-            {
-                return new DeviceStatusSnapshot
-                {
-                    Id = "com",
-                    DisplayName = "COM / последовательные порты",
-                    State = DeviceReadinessState.Error,
-                    StatusLabel = "Ошибка COM",
-                    Detail = $"Не удалось получить список COM-портов: {report.ProbeError}",
-                    IsBlocking = false
-                };
-            }
+            var configuredPort = controller?.ResolveConfiguredPort();
+            var aliasText = report.Aliases.Count == 0
+                ? "aliases не обнаружены"
+                : string.Join(", ", report.Aliases.Select(item => $"{item.Key} -> {item.Value}"));
+            var openedText = report.OpenedPorts.Count == 0 ? "не удалось открыть ни один порт" : string.Join(", ", report.OpenedPorts);
 
-            if (report.DetectedPorts.Length == 0)
+            if (report.DetectedPorts.Count == 0 && report.Aliases.Count == 0)
             {
                 return new DeviceStatusSnapshot
                 {
                     Id = "com",
-                    DisplayName = "COM / последовательные порты",
+                    DisplayName = "COM / контроллер",
                     State = DeviceReadinessState.Missing,
                     StatusLabel = "Порты не найдены",
-                    Detail = "COM-порты не обнаружены системой.",
-                    IsBlocking = false
+                    Detail = $"Serial-порты не обнаружены системой. Настроенный порт: {configuredPort ?? "не задан"}.",
+                    IsBlocking = true,
+                    BlockingLabel = "Блокирует реальный запуск: контроллер не обнаружен"
                 };
             }
-
-            var details = new List<string>
-            {
-                $"Найдены системой: {string.Join(", ", report.DetectedPorts)}."
-            };
-
-            if (report.AccessiblePorts.Length > 0)
-            {
-                details.Add($"Открываются: {string.Join(", ", report.AccessiblePorts)}.");
-            }
-
-            if (report.InaccessiblePorts.Length > 0)
-            {
-                details.Add($"Не открываются: {string.Join("; ", report.InaccessiblePorts)}.");
-            }
-
-            details.Add(BuildAssignmentsSummary(plans));
-
-            if (report.AccessiblePorts.Length == 0)
-            {
-                return new DeviceStatusSnapshot
-                {
-                    Id = "com",
-                    DisplayName = "COM / последовательные порты",
-                    State = DeviceReadinessState.Unavailable,
-                    StatusLabel = "Порты недоступны",
-                    Detail = string.Join(" ", details),
-                    IsBlocking = false
-                };
-            }
-
-            var hasImplementedHandshake = plans.Any(plan => plan.SmokeTest.IsImplemented);
-            details.Add(hasImplementedHandshake
-                ? "Handshake будет выполняться только для модулей с настроенным smoke-test."
-                : "Handshake для COM-модулей пока не настроен.");
 
             return new DeviceStatusSnapshot
             {
                 Id = "com",
-                DisplayName = "COM / последовательные порты",
-                State = DeviceReadinessState.Warning,
-                StatusLabel = "Порты обнаружены",
-                Detail = string.Join(" ", details),
+                DisplayName = "COM / контроллер",
+                State = report.OpenedPorts.Count > 0 ? DeviceReadinessState.Ready : DeviceReadinessState.Warning,
+                StatusLabel = report.OpenedPorts.Count > 0 ? "Порты обнаружены" : "Порты есть, но не открываются",
+                Detail = $"Detected: {string.Join(", ", report.DetectedPorts.DefaultIfEmpty("нет"))}. Opened: {openedText}. Настроенный порт: {configuredPort ?? "не задан"}. {aliasText}.",
                 IsBlocking = false
             };
         }
 
-        private static DeviceStatusSnapshot BuildPeripheralStatus(
-            bool diagnosticsMode,
-            SerialPortProbeReport report,
-            ComModuleProbePlan plan)
+        private DeviceStatusSnapshot BuildControllerConnectionStatus(SerialPortProbeReport report, Esp32ControllerConfig? controller, ControllerPreflightResult controllerProbe, bool diagnosticsMode)
         {
-            if (report.ProbeError is not null)
+            if (controller is null)
             {
                 return new DeviceStatusSnapshot
                 {
-                    Id = plan.Id,
-                    DisplayName = plan.DisplayName,
-                    State = DeviceReadinessState.Error,
-                    StatusLabel = "Ошибка COM",
-                    Detail = $"COM-окружение недоступно: {report.ProbeError}. {plan.IntegrationNote}",
-                    IsBlocking = !diagnosticsMode
-                };
-            }
-
-            if (string.IsNullOrWhiteSpace(plan.AssignedPort))
-            {
-                var detail = plan.CandidatePort is null
-                    ? $"Для модуля '{plan.DisplayName}' порт не назначен. {plan.IntegrationNote}"
-                    : $"Для модуля '{plan.DisplayName}' порт не назначен. Кандидат для проверки: {plan.CandidatePort}. {plan.IntegrationNote}";
-
-                return new DeviceStatusSnapshot
-                {
-                    Id = plan.Id,
-                    DisplayName = plan.DisplayName,
-                    State = diagnosticsMode ? DeviceReadinessState.Diagnostics : DeviceReadinessState.Missing,
-                    StatusLabel = "Порт не назначен",
-                    Detail = detail,
+                    Id = "controller-connect",
+                    DisplayName = "Подключение к контроллеру",
+                    State = DeviceReadinessState.Missing,
+                    StatusLabel = "Конфиг не задан",
+                    Detail = $"Файл {ConfigFileName} не содержит раздел controller.",
                     IsBlocking = !diagnosticsMode,
-                    BlockingLabel = diagnosticsMode
-                        ? "Доступен только diagnostics fallback"
-                        : "Блокирует реальный запуск: сначала назначьте COM-порт"
+                    BlockingLabel = "Блокирует реальный запуск: контроллер не настроен"
                 };
             }
 
-            var portResult = report.FindPort(plan.AssignedPort);
-            if (portResult is null)
+            var configuredPort = controller.ResolveConfiguredPort();
+            if (!controllerProbe.PortOpened || string.IsNullOrWhiteSpace(controllerProbe.PortName))
             {
                 return new DeviceStatusSnapshot
                 {
-                    Id = plan.Id,
-                    DisplayName = plan.DisplayName,
+                    Id = "controller-connect",
+                    DisplayName = "Подключение к контроллеру",
                     State = DeviceReadinessState.Missing,
                     StatusLabel = "Порт не найден",
-                    Detail = $"Для модуля '{plan.DisplayName}' назначен порт {plan.AssignedPort}, но система его сейчас не видит. {plan.IntegrationNote}",
-                    IsBlocking = !diagnosticsMode
+                    Detail = $"Ни один из путей контроллера не найден. Настроено: {configuredPort ?? "не задано"}. Обнаружено: {string.Join(", ", report.DetectedPorts.DefaultIfEmpty("нет"))}.",
+                    IsBlocking = !diagnosticsMode,
+                    BlockingLabel = "Блокирует реальный запуск: порт контроллера не найден"
                 };
             }
 
-            if (!portResult.IsAccessible)
+            var resolvedPort = controllerProbe.PortName ?? configuredPort ?? string.Empty;
+            var attempt = controllerProbe.PortOpened
+                ? new SerialPortOpenAttempt(resolvedPort, true, null)
+                : report.OpenAttempts.FirstOrDefault(item =>
+                    string.Equals(item.PortName, resolvedPort, StringComparison.OrdinalIgnoreCase));
+
+            if (controllerProbe.PortOpened && attempt is { Success: true })
             {
                 return new DeviceStatusSnapshot
                 {
-                    Id = plan.Id,
-                    DisplayName = plan.DisplayName,
-                    State = DeviceReadinessState.Unavailable,
-                    StatusLabel = "Порт недоступен",
-                    Detail = $"Для модуля '{plan.DisplayName}' назначенный порт {plan.AssignedPort} найден, но не открывается: {portResult.OpenError}. {plan.IntegrationNote}",
-                    IsBlocking = !diagnosticsMode
+                    Id = "controller-connect",
+                    DisplayName = "Подключение к контроллеру",
+                    State = DeviceReadinessState.Ready,
+                    StatusLabel = "Порт открыт",
+                    Detail = $"Контроллер привязан к {resolvedPort} и порт открывается на baudRate {controller.BaudRate}.",
+                    IsBlocking = false
                 };
             }
 
-            var smokeResult = RunSmokeTest(plan.SmokeTest, plan.AssignedPort);
-            var baseDetail = $"Для модуля '{plan.DisplayName}' назначенный порт {plan.AssignedPort} найден и открывается.";
-
-            return smokeResult.Outcome switch
+            var commandResolvedPort = controllerProbe.PortName ?? controller.ResolveConfiguredPort() ?? string.Empty;
+            if (false && (!controllerProbe.CommandsSent || string.IsNullOrWhiteSpace(commandResolvedPort)))
             {
-                SmokeTestOutcome.NotImplemented => new DeviceStatusSnapshot
+                return new DeviceStatusSnapshot
                 {
-                    Id = plan.Id,
-                    DisplayName = plan.DisplayName,
-                    State = diagnosticsMode ? DeviceReadinessState.Diagnostics : DeviceReadinessState.Warning,
-                    StatusLabel = "Handshake не реализован",
-                    Detail = $"{baseDetail} Протокол устройства ещё не проверен: handshake для этого типа модуля ещё не реализован. {plan.IntegrationNote}",
+                    Id = "controller-commands",
+                    DisplayName = "Отправка команд",
+                    State = DeviceReadinessState.Unavailable,
+                    StatusLabel = "Команды не отправляются",
+                    Detail = $"Preflight не подтвердил отправку x1x1x / x1x2x / x1x3x. {controllerProbe.ErrorMessage ?? "Причина не получена."}",
                     IsBlocking = !diagnosticsMode,
-                    BlockingLabel = diagnosticsMode
-                        ? "Доступен только diagnostics fallback"
-                        : "Блокирует реальный запуск: устройство не подтверждено"
-                },
-                SmokeTestOutcome.NoResponse => new DeviceStatusSnapshot
-                {
-                    Id = plan.Id,
-                    DisplayName = plan.DisplayName,
-                    State = diagnosticsMode ? DeviceReadinessState.Diagnostics : DeviceReadinessState.Warning,
-                    StatusLabel = "Handshake не выполнен",
-                    Detail = $"{baseDetail} Ответ от устройства не получен. {smokeResult.Detail} {plan.IntegrationNote}",
-                    IsBlocking = !diagnosticsMode,
-                    BlockingLabel = diagnosticsMode
-                        ? "Доступен только diagnostics fallback"
-                        : "Блокирует реальный запуск: устройство не подтверждено"
-                },
-                SmokeTestOutcome.Unrecognized => new DeviceStatusSnapshot
-                {
-                    Id = plan.Id,
-                    DisplayName = plan.DisplayName,
-                    State = diagnosticsMode ? DeviceReadinessState.Diagnostics : DeviceReadinessState.Warning,
-                    StatusLabel = "Устройство не распознано",
-                    Detail = $"{baseDetail} Handshake выполнен, но ответ не совпал с ожидаемым протоколом. {smokeResult.Detail} {plan.IntegrationNote}",
-                    IsBlocking = !diagnosticsMode,
-                    BlockingLabel = diagnosticsMode
-                        ? "Доступен только diagnostics fallback"
-                        : "Блокирует реальный запуск: устройство не подтверждено"
-                },
-                SmokeTestOutcome.Confirmed when !plan.ProviderImplemented => new DeviceStatusSnapshot
-                {
-                    Id = plan.Id,
-                    DisplayName = plan.DisplayName,
-                    State = diagnosticsMode ? DeviceReadinessState.Diagnostics : DeviceReadinessState.Warning,
-                    StatusLabel = "Устройство подтверждено",
-                    Detail = $"{baseDetail} Handshake выполнен успешно. Устройство подтверждено, но модуль измерения ещё не подключен к real provider. {smokeResult.Detail}",
-                    IsBlocking = !diagnosticsMode,
-                    BlockingLabel = diagnosticsMode
-                        ? "Доступен только diagnostics fallback"
-                        : "Блокирует реальный запуск: нет real provider"
-                },
-                SmokeTestOutcome.Confirmed => new DeviceStatusSnapshot
-                {
-                    Id = plan.Id,
-                    DisplayName = plan.DisplayName,
-                    State = DeviceReadinessState.Ready,
-                    StatusLabel = "Модуль готов",
-                    Detail = $"{baseDetail} Handshake выполнен успешно, модуль подтвержден как готовый. {smokeResult.Detail}",
-                    IsBlocking = false
-                },
-                SmokeTestOutcome.Error => new DeviceStatusSnapshot
-                {
-                    Id = plan.Id,
-                    DisplayName = plan.DisplayName,
-                    State = diagnosticsMode ? DeviceReadinessState.Diagnostics : DeviceReadinessState.Error,
-                    StatusLabel = "Ошибка handshake",
-                    Detail = $"{baseDetail} Ошибка smoke-test: {smokeResult.Detail} {plan.IntegrationNote}",
-                    IsBlocking = !diagnosticsMode,
-                    BlockingLabel = diagnosticsMode
-                        ? "Доступен только diagnostics fallback"
-                        : "Блокирует реальный запуск: smoke-test завершился ошибкой"
-                },
-                _ => new DeviceStatusSnapshot
-                {
-                    Id = plan.Id,
-                    DisplayName = plan.DisplayName,
-                    State = diagnosticsMode ? DeviceReadinessState.Diagnostics : DeviceReadinessState.Warning,
-                    StatusLabel = "Diagnostics fallback",
-                    Detail = $"{baseDetail} Реальная готовность не подтверждена. {plan.IntegrationNote}",
-                    IsBlocking = !diagnosticsMode
-                }
-            };
-        }
-
-        private IReadOnlyList<ComModuleProbePlan> BuildComModulePlans(SerialPortProbeReport report)
-        {
-            var moduleDefinitions = new[]
-            {
-                new ComModuleDefinition("watch", "Часы / носимое устройство", "Нужен конкретный COM-протокол или SDK устройства."),
-                new ComModuleDefinition("thermometer", "Термометр", "Ожидается явная привязка к драйверу или COM-модулю."),
-                new ComModuleDefinition("breathalyzer", "Алкотестер", "Нужен текстовый или JSON-протокол поверх SerialPort."),
-                new ComModuleDefinition("blood-pressure", "Тонометр", "Нужен отдельный device provider вместо baseline-симуляции."),
-                new ComModuleDefinition("glucose-meter", "Глюкометр", "Нужен provider для реального получения значения.")
-            };
-
-            var config = TryLoadComAssignments();
-            var candidatePort = PickDefaultCandidatePort(report);
-
-            return moduleDefinitions
-                .Select(definition =>
-                {
-                    config.Modules.TryGetValue(definition.Id, out var moduleConfig);
-                    var assignedPort = NormalizePortName(moduleConfig?.Port);
-                    var smokeTest = BuildSmokeTest(moduleConfig);
-                    var candidate = assignedPort ?? ResolveCandidatePort(definition.Id, candidatePort, report);
-
-                    return new ComModuleProbePlan(
-                        definition.Id,
-                        definition.DisplayName,
-                        definition.IntegrationNote,
-                        assignedPort,
-                        candidate,
-                        ProviderImplemented: false,
-                        SmokeTest: smokeTest);
-                })
-                .ToArray();
-        }
-
-        private ComAssignmentsConfig TryLoadComAssignments()
-        {
-            var configPath = Path.Combine(baseDirectory, "device-port-map.json");
-            if (!File.Exists(configPath))
-            {
-                return ComAssignmentsConfig.Empty;
+                    BlockingLabel = "Блокирует реальный запуск: команды ESP32 не отправляются"
+                };
             }
 
+            return new DeviceStatusSnapshot
+            {
+                Id = "controller-connect",
+                DisplayName = "Подключение к контроллеру",
+                State = DeviceReadinessState.Unavailable,
+                StatusLabel = "Порт не открывается",
+                Detail = $"Путь {resolvedPort} найден, но открыть его не удалось. {attempt?.ErrorMessage ?? "Причина не получена."}",
+                IsBlocking = !diagnosticsMode,
+                BlockingLabel = "Блокирует реальный запуск: контроллер недоступен"
+            };
+        }
+
+        private DeviceStatusSnapshot BuildControllerCommandStatus(Esp32ControllerConfig? controller, ControllerPreflightResult controllerProbe, bool diagnosticsMode)
+        {
+            if (controller is null)
+            {
+                return new DeviceStatusSnapshot
+                {
+                    Id = "controller-commands",
+                    DisplayName = "Отправка команд",
+                    State = DeviceReadinessState.Skipped,
+                    StatusLabel = "Пропущено до подключения",
+                    Detail = "Команды x1x1x / x1x2x / x1x3x будут отправлены только после успешного открытия порта контроллера.",
+                    IsBlocking = false
+                };
+            }
+
+            var resolvedPort = controllerProbe.PortName ?? controller.ResolveConfiguredPort() ?? string.Empty;
+            if (!controllerProbe.CommandsSent || string.IsNullOrWhiteSpace(resolvedPort))
+            {
+                return new DeviceStatusSnapshot
+                {
+                    Id = "controller-commands",
+                    DisplayName = "Отправка команд",
+                    State = DeviceReadinessState.Unavailable,
+                    StatusLabel = "Команды не отправляются",
+                    Detail = $"Preflight не подтвердил отправку x1x1x / x1x2x / x1x3x. {controllerProbe.ErrorMessage ?? "Причина не получена."}",
+                    IsBlocking = !diagnosticsMode,
+                    BlockingLabel = "Блокирует реальный запуск: команды ESP32 не отправляются"
+                };
+            }
+
+            return new DeviceStatusSnapshot
+            {
+                Id = "controller-commands",
+                DisplayName = "Отправка команд",
+                State = DeviceReadinessState.Ready,
+                StatusLabel = "Сценарий подготовлен",
+                Detail = $"Основной сценарий готов отправить x1x1x, x1x2x, x1x3x через {resolvedPort} при baudRate {controller!.BaudRate}.",
+                IsBlocking = false
+            };
+        }
+
+        private DeviceStatusSnapshot BuildControllerDataStatus(ControllerPreflightResult controllerProbe)
+        {
+            var resolvedPort = controllerProbe.PortName ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(resolvedPort))
+            {
+                return new DeviceStatusSnapshot
+                {
+                    Id = "controller-data",
+                    DisplayName = "Получение JSON",
+                    State = DeviceReadinessState.Skipped,
+                    StatusLabel = "Пропущено до подключения",
+                    Detail = "JSON {Temp,Alco,SYS,DAD} будет ожидаться после успешного подключения к контроллеру.",
+                    IsBlocking = false
+                };
+            }
+
+            return new DeviceStatusSnapshot
+            {
+                Id = "controller-data",
+                DisplayName = "Получение JSON",
+                State = DeviceReadinessState.Warning,
+                StatusLabel = "Проверка ответа в runtime",
+                Detail = $"Preflight подтвердил только порт {resolvedPort}. Реальный JSON-ответ контроллера проверяется в основном сценарии чтения.",
+                IsBlocking = false
+            };
+        }
+
+        private static bool IsControllerPortOpen(SerialPortProbeReport report, Esp32ControllerConfig? controller, out string resolvedPort)
+        {
+            resolvedPort = controller?.ResolvePort() ?? string.Empty;
+            var portName = resolvedPort;
+            return !string.IsNullOrWhiteSpace(resolvedPort)
+                && report.OpenAttempts.Any(item =>
+                    item.Success && string.Equals(item.PortName, portName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private ControllerPreflightResult ProbeController(Esp32ControllerConfig? controller, CancellationToken cancellationToken)
+        {
+            if (controller is null)
+            {
+                return new ControllerPreflightResult(null, false, false, null);
+            }
+
+            Exception? lastException = null;
+            string? lastOpenedPort = null;
+
+            foreach (var candidate in controller.EnumerateCandidatePorts())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                logStore.Info("Preflight", $"Preflight step started: controller connect {candidate}");
+                try
+                {
+                    using var port = new SerialPort(candidate, controller.BaudRate)
+                    {
+                        ReadTimeout = controller.PreflightTimeoutMs,
+                        WriteTimeout = controller.PreflightTimeoutMs
+                    };
+
+                    port.Open();
+                    lastOpenedPort = candidate;
+                    logStore.Info("Preflight", $"Open controller port: {candidate}");
+                    port.Write("x1x1x");
+                    Thread.Sleep(controller.PreflightCommandDelayMs);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    port.Write("x1x2x");
+                    Thread.Sleep(controller.PreflightCommandDelayMs);
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    logStore.Info("Preflight", "Preflight step completed: controller commands sent safely");
+                    return new ControllerPreflightResult(candidate, true, true, null);
+                }
+                catch (OperationCanceledException)
+                {
+                    logStore.Warning("Preflight", "Measurement aborted for safety");
+                    throw;
+                }
+                catch (TimeoutException ex)
+                {
+                    lastException = ex;
+                    logStore.Warning("Preflight", $"Preflight step timeout: {candidate} ({ex.Message})");
+                }
+                catch (Exception ex)
+                {
+                    lastException = ex;
+                    logStore.Warning("Preflight", $"Preflight step failed: {candidate} ({ex.Message})");
+                }
+            }
+
+            return new ControllerPreflightResult(
+                lastOpenedPort ?? controller.ResolveConfiguredPort(),
+                lastOpenedPort is not null,
+                false,
+                lastException?.Message);
+        }
+
+        private SerialPortProbeReport ProbeSerialPorts()
+        {
+            var detectedPorts = GetSerialPorts();
+            var aliases = GetLinuxSerialAliases();
+            var openAttempts = detectedPorts.Select(TryOpenPort).ToList();
+            return new SerialPortProbeReport(detectedPorts, aliases, openAttempts);
+        }
+
+        private List<string> GetSerialPorts()
+        {
+            var ports = new HashSet<string>(SerialPort.GetPortNames(), StringComparer.OrdinalIgnoreCase);
+            if (OperatingSystem.IsLinux())
+            {
+                foreach (var prefix in new[] { "/dev/ttyUSB", "/dev/ttyACM" })
+                {
+                    foreach (var path in SafeEnumerate(prefix + "*"))
+                    {
+                        ports.Add(path);
+                    }
+                }
+            }
+
+            return ports.OrderBy(item => item, StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
+        private static IReadOnlyList<string> SafeEnumerate(string pattern)
+        {
             try
             {
-                var json = File.ReadAllText(configPath);
-                var config = JsonSerializer.Deserialize<ComAssignmentsConfig>(json, new JsonSerializerOptions
-                {
-                    PropertyNameCaseInsensitive = true
-                });
-
-                return config ?? ComAssignmentsConfig.Empty;
+                var directory = Path.GetDirectoryName(pattern);
+                var filePattern = Path.GetFileName(pattern);
+                return string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory)
+                    ? Array.Empty<string>()
+                    : Directory.EnumerateFiles(directory, filePattern).OrderBy(item => item, StringComparer.OrdinalIgnoreCase).ToArray();
             }
             catch
             {
-                return ComAssignmentsConfig.Empty;
-            }
-        }
-
-        private static SerialPortProbeReport ProbeSerialPorts()
-        {
-            var ports = GetSerialPorts(out var error);
-            if (error is not null)
-            {
-                return new SerialPortProbeReport(Array.Empty<SerialPortProbeResult>(), error);
-            }
-
-            var results = ports
-                .Select(portName =>
-                {
-                    var openError = TryOpenPort(portName);
-                    return new SerialPortProbeResult(portName, openError is null, openError);
-                })
-                .ToArray();
-
-            return new SerialPortProbeReport(results, null);
-        }
-
-        private static SmokeTestResult RunSmokeTest(ComSmokeTestDefinition smokeTest, string portName)
-        {
-            if (!smokeTest.IsImplemented)
-            {
-                return SmokeTestResult.NotImplemented();
-            }
-
-            if (!string.Equals(smokeTest.Protocol, "serial-text", StringComparison.OrdinalIgnoreCase))
-            {
-                return SmokeTestResult.NotImplemented(
-                    $"Протокол '{smokeTest.Protocol}' пока не поддержан в preflight.");
-            }
-
-            try
-            {
-                using var port = new SerialPort(portName, smokeTest.BaudRate)
-                {
-                    ReadTimeout = smokeTest.TimeoutMs,
-                    WriteTimeout = smokeTest.TimeoutMs,
-                    NewLine = smokeTest.NewLine,
-                    DtrEnable = false,
-                    RtsEnable = false
-                };
-
-                port.Open();
-
-                if (!string.IsNullOrEmpty(smokeTest.Message))
-                {
-                    if (smokeTest.RawWrite)
-                    {
-                        port.Write(smokeTest.Message);
-                    }
-                    else
-                    {
-                        port.WriteLine(smokeTest.Message);
-                    }
-                }
-
-                Thread.Sleep(Math.Min(smokeTest.TimeoutMs, 250));
-
-                string response;
-                try
-                {
-                    response = smokeTest.ReadLine ? port.ReadLine() : port.ReadExisting();
-                }
-                catch (TimeoutException)
-                {
-                    response = string.Empty;
-                }
-
-                if (string.IsNullOrWhiteSpace(response))
-                {
-                    return new SmokeTestResult(
-                        SmokeTestOutcome.NoResponse,
-                        $"Smoke-test отправил '{smokeTest.Message}', но ответ пустой.");
-                }
-
-                if (!string.IsNullOrWhiteSpace(smokeTest.ExpectedResponseContains)
-                    && response.IndexOf(smokeTest.ExpectedResponseContains, StringComparison.OrdinalIgnoreCase) < 0)
-                {
-                    return new SmokeTestResult(
-                        SmokeTestOutcome.Unrecognized,
-                        $"Получен ответ '{response}', ожидался фрагмент '{smokeTest.ExpectedResponseContains}'.");
-                }
-
-                return new SmokeTestResult(
-                    SmokeTestOutcome.Confirmed,
-                    $"Smoke-test получил ответ '{response}'.");
-            }
-            catch (Exception ex)
-            {
-                return new SmokeTestResult(SmokeTestOutcome.Error, ex.Message);
-            }
-        }
-
-        private static ComSmokeTestDefinition BuildSmokeTest(ComModulePortConfig? config)
-        {
-            if (config is null || string.IsNullOrWhiteSpace(config.SmokeProtocol))
-            {
-                return ComSmokeTestDefinition.NotImplemented;
-            }
-
-            return new ComSmokeTestDefinition(
-                config.SmokeProtocol.Trim(),
-                config.BaudRate ?? 9600,
-                config.Message ?? "PING",
-                config.TimeoutMs ?? 1500,
-                config.ReadLine ?? false,
-                config.RawWrite ?? false,
-                DecodeEscapes(config.NewLine ?? "\\n"),
-                config.ExpectedResponseContains);
-        }
-
-        private static string? ResolveCandidatePort(string deviceId, string? defaultCandidatePort, SerialPortProbeReport report)
-        {
-            if (defaultCandidatePort is not null)
-            {
-                return defaultCandidatePort;
-            }
-
-            if (report.DetectedPorts.Length == 0)
-            {
-                return null;
-            }
-
-            return deviceId == "watch"
-                ? report.DetectedPorts.LastOrDefault()
-                : report.DetectedPorts.FirstOrDefault();
-        }
-
-        private static string? PickDefaultCandidatePort(SerialPortProbeReport report)
-        {
-            var preferred = report.AccessiblePorts
-                .Where(port => !string.Equals(port, "COM1", StringComparison.OrdinalIgnoreCase))
-                .OrderBy(port => port, StringComparer.OrdinalIgnoreCase)
-                .LastOrDefault();
-
-            return preferred
-                ?? report.AccessiblePorts.LastOrDefault()
-                ?? report.DetectedPorts
-                    .Where(port => !string.Equals(port, "COM1", StringComparison.OrdinalIgnoreCase))
-                    .OrderBy(port => port, StringComparer.OrdinalIgnoreCase)
-                    .LastOrDefault()
-                ?? report.DetectedPorts.LastOrDefault();
-        }
-
-        private static string BuildAssignmentsSummary(IReadOnlyList<ComModuleProbePlan> plans)
-        {
-            var parts = plans.Select(plan =>
-            {
-                if (!string.IsNullOrWhiteSpace(plan.AssignedPort))
-                {
-                    return $"{plan.DisplayName} -> {plan.AssignedPort}";
-                }
-
-                if (!string.IsNullOrWhiteSpace(plan.CandidatePort))
-                {
-                    return $"{plan.DisplayName} -> кандидат {plan.CandidatePort}";
-                }
-
-                return $"{plan.DisplayName} -> не назначен";
-            });
-
-            return $"Модули: {string.Join("; ", parts)}.";
-        }
-
-        private static string? NormalizePortName(string? value) =>
-            string.IsNullOrWhiteSpace(value)
-                ? null
-                : value.Trim().ToUpperInvariant();
-
-        private static string DecodeEscapes(string value) =>
-            value
-                .Replace("\\r", "\r", StringComparison.Ordinal)
-                .Replace("\\n", "\n", StringComparison.Ordinal)
-                .Replace("\\t", "\t", StringComparison.Ordinal);
-
-        private static string? TryOpenPort(string portName)
-        {
-            try
-            {
-                using var port = new SerialPort(portName, 9600)
-                {
-                    ReadTimeout = 250,
-                    WriteTimeout = 250,
-                    DtrEnable = false,
-                    RtsEnable = false
-                };
-
-                port.Open();
-                return null;
-            }
-            catch (Exception ex)
-            {
-                return ex.Message;
-            }
-        }
-
-        private static string[] GetSerialPorts(out string? error)
-        {
-            try
-            {
-                error = null;
-                return SerialPort.GetPortNames()
-                    .OrderBy(port => port, StringComparer.OrdinalIgnoreCase)
-                    .ToArray();
-            }
-            catch (Exception ex)
-            {
-                error = ex.Message;
                 return Array.Empty<string>();
             }
         }
 
-        private sealed record CameraProbeResult(DeviceStatusSnapshot Status, byte[]? FrameBytes = null);
-        private sealed record ComModuleDefinition(string Id, string DisplayName, string IntegrationNote);
-        private sealed record ComModuleProbePlan(
-            string Id,
-            string DisplayName,
-            string IntegrationNote,
-            string? AssignedPort,
-            string? CandidatePort,
-            bool ProviderImplemented,
-            ComSmokeTestDefinition SmokeTest);
-        private sealed record SerialPortProbeResult(string PortName, bool IsAccessible, string? OpenError);
-
-        private sealed record SerialPortProbeReport(SerialPortProbeResult[] PortResults, string? ProbeError)
+        private static IReadOnlyDictionary<string, string> GetLinuxSerialAliases()
         {
-            public string[] DetectedPorts => PortResults.Select(result => result.PortName).ToArray();
-            public string[] AccessiblePorts => PortResults.Where(result => result.IsAccessible).Select(result => result.PortName).ToArray();
-            public string[] InaccessiblePorts => PortResults.Where(result => !result.IsAccessible).Select(result => $"{result.PortName} ({result.OpenError})").ToArray();
+            if (!OperatingSystem.IsLinux())
+            {
+                return new Dictionary<string, string>();
+            }
 
-            public SerialPortProbeResult? FindPort(string portName) =>
-                PortResults.FirstOrDefault(result =>
-                    string.Equals(result.PortName, portName, StringComparison.OrdinalIgnoreCase));
+            var aliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var basePath in new[] { "/dev/serial/by-id", "/dev/serial/by-path" })
+            {
+                if (!Directory.Exists(basePath))
+                {
+                    continue;
+                }
+
+                foreach (var entry in Directory.EnumerateFileSystemEntries(basePath))
+                {
+                    try
+                    {
+                        aliases[entry] = File.ResolveLinkTarget(entry, false)?.FullName ?? entry;
+                    }
+                    catch
+                    {
+                        aliases[entry] = entry;
+                    }
+                }
+            }
+
+            return aliases;
         }
 
-        private sealed record ComSmokeTestDefinition(
-            string Protocol,
-            int BaudRate,
-            string Message,
-            int TimeoutMs,
-            bool ReadLine,
-            bool RawWrite,
-            string NewLine,
-            string? ExpectedResponseContains)
+        private static SerialPortOpenAttempt TryOpenPort(string portName)
         {
-            public static readonly ComSmokeTestDefinition NotImplemented =
-                new("none", 9600, "PING", 1500, false, false, "\n", null);
+            try
+            {
+                using var port = new SerialPort(portName)
+                {
+                    ReadTimeout = 500,
+                    WriteTimeout = 500
+                };
 
-            public bool IsImplemented =>
-                !string.Equals(Protocol, "none", StringComparison.OrdinalIgnoreCase);
+                port.Open();
+                return new SerialPortOpenAttempt(portName, true, null);
+            }
+            catch (Exception ex)
+            {
+                return new SerialPortOpenAttempt(portName, false, ex.Message);
+            }
         }
 
-        private sealed record SmokeTestResult(SmokeTestOutcome Outcome, string Detail)
+        private DevicePortMapConfig TryLoadConfig()
         {
-            public static SmokeTestResult NotImplemented(string? detail = null) =>
-                new(SmokeTestOutcome.NotImplemented, detail ?? "Handshake для этого модуля ещё не реализован.");
+            var path = Path.Combine(baseDirectory, ConfigFileName);
+            if (!File.Exists(path))
+            {
+                return new DevicePortMapConfig();
+            }
+
+            try
+            {
+                var json = File.ReadAllText(path);
+                return JsonSerializer.Deserialize<DevicePortMapConfig>(json, new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                }) ?? new DevicePortMapConfig();
+            }
+            catch
+            {
+                return new DevicePortMapConfig();
+            }
         }
 
-        private enum SmokeTestOutcome
+        private DeviceStatusSnapshot BuildControllerSmokeStatus(string resolvedPort, string rawResponse)
         {
-            NotImplemented,
-            NoResponse,
-            Unrecognized,
-            Confirmed,
-            Error
+            var normalized = NormalizeControllerJson(rawResponse);
+            using var document = JsonDocument.Parse(normalized);
+            var root = document.RootElement;
+            var keys = new[] { "Temp", "Alco", "SYS", "DAD" };
+            var missing = keys.Where(key => !root.TryGetProperty(key, out _)).ToArray();
+
+            return missing.Length == 0
+                ? new DeviceStatusSnapshot
+                {
+                    Id = "controller-data",
+                    DisplayName = "Получение JSON",
+                    State = DeviceReadinessState.Ready,
+                    StatusLabel = "JSON подтверждён",
+                    Detail = $"Контроллер {resolvedPort} вернул JSON с полями Temp, Alco, SYS, DAD.",
+                    IsBlocking = false
+                }
+                : new DeviceStatusSnapshot
+                {
+                    Id = "controller-data",
+                    DisplayName = "Получение JSON",
+                    State = DeviceReadinessState.Warning,
+                    StatusLabel = "JSON неполный",
+                    Detail = $"Контроллер {resolvedPort} ответил JSON, но отсутствуют поля: {string.Join(", ", missing)}.",
+                    IsBlocking = false
+                };
         }
 
-        private sealed class ComAssignmentsConfig
+        private static string NormalizeControllerJson(string payload)
         {
-            public static ComAssignmentsConfig Empty { get; } = new();
-
-            public Dictionary<string, ComModulePortConfig> Modules { get; init; } =
-                new(StringComparer.OrdinalIgnoreCase);
+            return Regex.Replace(payload.Trim(), @"(?<=[{,])\s*(Temp|Alco|SYS|DAD)\s*:", "\"$1\":");
         }
 
-        private sealed class ComModulePortConfig
+        private static string BuildCameraEnvironmentDetail(IReadOnlyList<string> deviceList, string? selectedDevice, string? permissionNote)
         {
+            var parts = new List<string>
+            {
+                $"Detected: {(deviceList.Count == 0 ? "нет video-устройств" : string.Join(", ", deviceList))}",
+                $"Selected: {selectedDevice ?? "не выбрано"}"
+            };
+
+            if (!string.IsNullOrWhiteSpace(permissionNote))
+            {
+                parts.Add(permissionNote);
+            }
+
+            return string.Join(". ", parts) + ".";
+        }
+
+        private static List<string> GetLinuxVideoDevices()
+        {
+            if (!OperatingSystem.IsLinux())
+            {
+                return new List<string>();
+            }
+
+            return SafeEnumerate("/dev/video*").ToList();
+        }
+
+        private static string? GetPrimaryLinuxVideoDevice(IReadOnlyList<string> devices)
+        {
+            if (!OperatingSystem.IsLinux())
+            {
+                return null;
+            }
+
+            return devices.FirstOrDefault(item => string.Equals(item, LinuxPrimaryVideoDevice, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static string? GetLinuxCameraPermissionNote()
+        {
+            if (!OperatingSystem.IsLinux())
+            {
+                return null;
+            }
+
+            try
+            {
+                var groups = File.ReadAllLines("/etc/group");
+                var videoGroup = groups.FirstOrDefault(line => line.StartsWith("video:", StringComparison.Ordinal));
+                return videoGroup is null ? "Группа video не найдена в системе." : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static bool IsPermissionError(Exception exception)
+        {
+            var message = exception.Message.ToLowerInvariant();
+            return message.Contains("permission")
+                || message.Contains("access denied")
+                || message.Contains("denied")
+                || message.Contains("eacces");
+        }
+
+        private static SKBitmap? TryConvertMatToSkBitmap(Mat frame)
+        {
+            try
+            {
+                using var converted = new Mat();
+                if (frame.NumberOfChannels == 4)
+                {
+                    CvInvoke.CvtColor(frame, converted, ColorConversion.Bgra2Rgba);
+                }
+                else if (frame.NumberOfChannels == 3)
+                {
+                    CvInvoke.CvtColor(frame, converted, ColorConversion.Bgr2Rgba);
+                }
+                else if (frame.NumberOfChannels == 1)
+                {
+                    CvInvoke.CvtColor(frame, converted, ColorConversion.Gray2Rgba);
+                }
+                else
+                {
+                    return null;
+                }
+
+                var bytes = new byte[converted.Rows * converted.Cols * converted.NumberOfChannels];
+                Marshal.Copy(converted.DataPointer, bytes, 0, bytes.Length);
+                var bitmap = new SKBitmap(converted.Cols, converted.Rows, SKColorType.Rgba8888, SKAlphaType.Opaque);
+                Marshal.Copy(bytes, 0, bitmap.GetPixels(), bytes.Length);
+                return bitmap;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static SKBitmap ApplyCameraRotation(SKBitmap source, int cameraRotation)
+        {
+            if (cameraRotation != 180)
+            {
+                return source.Copy();
+            }
+
+            var rotated = new SKBitmap(source.Width, source.Height, source.ColorType, source.AlphaType);
+            using var canvas = new SKCanvas(rotated);
+            canvas.Translate(source.Width, source.Height);
+            canvas.RotateDegrees(180);
+            canvas.DrawBitmap(source, 0, 0);
+            canvas.Flush();
+            return rotated;
+        }
+
+        private sealed record CameraProbeResult(DeviceStatusSnapshot Status, byte[]? SampleFrameBytes = null);
+
+        private sealed record SerialPortProbeReport(
+            IReadOnlyList<string> DetectedPorts,
+            IReadOnlyDictionary<string, string> Aliases,
+            IReadOnlyList<SerialPortOpenAttempt> OpenAttempts)
+        {
+            public IReadOnlyList<string> OpenedPorts =>
+                OpenAttempts.Where(item => item.Success).Select(item => item.PortName).ToArray();
+        }
+
+        private sealed record ControllerPreflightResult(string? PortName, bool PortOpened, bool CommandsSent, string? ErrorMessage);
+
+        private sealed record SerialPortOpenAttempt(string PortName, bool Success, string? ErrorMessage);
+
+        private sealed class DevicePortMapConfig
+        {
+            [JsonPropertyName("cameraRotation")]
+            public int CameraRotation { get; init; }
+
+            [JsonPropertyName("linuxNoCameraMode")]
+            public bool LinuxNoCameraMode { get; init; }
+
+            [JsonPropertyName("controller")]
+            public Esp32ControllerConfig? Controller { get; init; }
+        }
+
+        private sealed class Esp32ControllerConfig
+        {
+            [JsonPropertyName("port")]
             public string? Port { get; init; }
-            public string? SmokeProtocol { get; init; }
-            public int? BaudRate { get; init; }
-            public string? Message { get; init; }
-            public int? TimeoutMs { get; init; }
-            public bool? ReadLine { get; init; }
-            public bool? RawWrite { get; init; }
-            public string? NewLine { get; init; }
-            public string? ExpectedResponseContains { get; init; }
+
+            [JsonPropertyName("portCandidates")]
+            public string[]? PortCandidates { get; init; }
+
+            [JsonPropertyName("baudRate")]
+            public int BaudRate { get; init; } = 115200;
+            public int PreflightTimeoutMs { get; init; } = 1500;
+            public int PreflightCommandDelayMs { get; init; } = 75;
+
+            public string? ResolveConfiguredPort() =>
+                EnumerateCandidatePorts().FirstOrDefault();
+
+            public string? ResolvePort() =>
+                EnumerateCandidatePorts().FirstOrDefault(path =>
+                    !string.IsNullOrWhiteSpace(path) && (File.Exists(path) || SerialPort.GetPortNames().Contains(path, StringComparer.OrdinalIgnoreCase)));
+
+            public IEnumerable<string> EnumerateCandidatePorts()
+            {
+                var candidates = new List<string>();
+                if (!string.IsNullOrWhiteSpace(Port))
+                {
+                    candidates.Add(Port);
+                }
+
+                if (PortCandidates is not null)
+                {
+                    candidates.AddRange(PortCandidates.Where(item => !string.IsNullOrWhiteSpace(item)));
+                }
+
+                IEnumerable<string> orderedCandidates = candidates.Distinct(StringComparer.OrdinalIgnoreCase);
+                if (OperatingSystem.IsLinux())
+                {
+                    orderedCandidates = orderedCandidates
+                        .OrderBy(GetLinuxPriority)
+                        .ThenBy(item => item, StringComparer.OrdinalIgnoreCase);
+                }
+
+                foreach (var candidate in orderedCandidates)
+                {
+                    yield return candidate;
+                }
+            }
+
+            private static int GetLinuxPriority(string portName)
+            {
+                if (string.Equals(portName, "/dev/ttyUSB0", StringComparison.OrdinalIgnoreCase))
+                {
+                    return 0;
+                }
+
+                if (portName.StartsWith("/dev/ttyUSB", StringComparison.OrdinalIgnoreCase))
+                {
+                    return 1;
+                }
+
+                if (portName.StartsWith("/dev/ttyACM", StringComparison.OrdinalIgnoreCase))
+                {
+                    return 2;
+                }
+
+                if (portName.Contains("/dev/serial/by-id/", StringComparison.OrdinalIgnoreCase))
+                {
+                    return 3;
+                }
+
+                return 4;
+            }
         }
     }
 }

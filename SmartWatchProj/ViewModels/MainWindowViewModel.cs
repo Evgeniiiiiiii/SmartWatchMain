@@ -17,15 +17,18 @@ using PdfSharpCore.Drawing;
 using PdfSharpCore.Pdf;
 using SkiaSharp;
 using SmartWatchProj.Models;
+using SmartWatchProj.Services.Devices;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using YoloDotNet;
 using YoloDotNet.Core;
@@ -94,6 +97,7 @@ namespace SmartWatchProj.ViewModels
 
         [ObservableProperty] private bool isOverlayVisible = false;  // Видимость оверлея
         [ObservableProperty] private bool isCaptchaVisible = false;  // Видимость CAPTCHA (true сначала)
+        [ObservableProperty] private string hardwareSafetyStatus = "Готов к работе.";
         [ObservableProperty] private string captchaPrompt = "";  // Текст "Проверка: Нажмите на все цифры X"
         [ObservableProperty] private string currentInstruction = "";  // Текст текущей инструкции
         [ObservableProperty] private double progressValue = 0;  // Значение ProgressBar (0-100)
@@ -113,9 +117,12 @@ namespace SmartWatchProj.ViewModels
         private List<int> selectedCaptchaIndices = new List<int>();  // Выбранные индексы
         private List<int> correctCaptchaIndices = new List<int>();  // Индексы с targetDigit
         private TaskCompletionSource<VitalMeasurement>? _measurementCompletion;  // Для ожидания результата измерений
+        private CancellationTokenSource? measurementRunCts;
+        private CancellationTokenSource? preflightCts;
 
         private const string EmployeesJsonPath = "employees.json";
         private const string MeasurementsJsonPath = "measurements.json";
+        private const string DeviceConfigFileName = "device-port-map.json";
         private int currentEmployeeId;
         private VideoCapture? capture;
         private Yolo? yoloEngine;
@@ -198,15 +205,32 @@ namespace SmartWatchProj.ViewModels
             TopInfoMessage = string.Empty; // тут же скроется панель
         }
 
+        partial void OnIsCollectingDataChanged(bool value)
+        {
+            OnPropertyChanged(nameof(CanEmergencyStop));
+        }
+
         // Команда для кнопки Старт
         [RelayCommand]
         private async Task Start()
         {
+            if (IsCollectingData)
+            {
+                LogWarning("Start", "Runtime blocked: measurement already in progress.");
+                ShowTopInfo("Старт временно заблокирован: измерение уже выполняется.", Brushes.Red);
+                return;
+            }
+
             try
             {
+                LogInfo("Start", "Start requested");
+                CancelMeasurementOperation("start requested new measurement run");
+                measurementRunCts = new CancellationTokenSource();
+                var runCts = measurementRunCts;
                 IsDevicePanelOpen = false;
                 ClearTopInfo();//
                 IsCollectingData = true;
+                HardwareSafetyStatus = "Подготовка к измерению.";
                 ResultMessage = "Проверка пользователя...";
                 ResultColor = Avalonia.Media.Brushes.Black;
                 CameraMessage = string.Empty;
@@ -214,34 +238,105 @@ namespace SmartWatchProj.ViewModels
                 await CheckEmployeeByCardId();
                 if (!IsEmployeeFound)
                 {
+                    LogWarning("Start", "Runtime blocked: employee not resolved.");
                     ShowTopInfo("Сотрудник не найден", Brushes.Red);
                     IsCollectingData = false;
                     return;
                 }
+
+                if (currentEmployeeId <= 0)
+                {
+                    throw new InvalidOperationException("employee not resolved");
+                }
+
+                var currentEmployee = Employees.FirstOrDefault(employee => employee.Id == currentEmployeeId);
+                if (currentEmployee is null)
+                {
+                    throw new InvalidOperationException("current employee is null");
+                }
+
+                LogInfo("Start", $"Employee resolved: id={currentEmployee.Id}, card={currentEmployee.CardId}.");
+                await EnsurePreflightReadyAsync();
+                LogInfo("Start", $"Equipment state validated. {StartBlockingSummary}");
+                if (IsStrictHardwareMode && DeviceStatuses.Any(snapshot => snapshot.IsBlocking))
+                {
+                    throw new InvalidOperationException(StartAvailabilityReason);
+                }
+
+                if (IsNoCameraModeEnabled)
+                {
+                    LogWarning("Start", "Camera stage bypassed by config");
+                }
+                else
+                {
+                    LogInfo("Start", "Camera stage entered.");
+                }
+
                 bool verified = await VerifyEmployeePresenceAsync();
                 if (!verified)
                 {
+                    LogWarning("Start", "Runtime blocked: presence check rejected.");
                     CameraMessage = "Проверка не пройдена. Повторите.";
                     CameraMessageColor = Avalonia.Media.Brushes.Red;
                     return;
                 }
+
+                LogInfo("Start", IsNoCameraModeEnabled
+                    ? "Camera stage skipped by config."
+                    : "Camera stage skipped or completed without blocking runtime.");
                 if (string.IsNullOrWhiteSpace(CameraMessage))
                 {
                     CameraMessage = "Пользователь верифицирован.";
                     CameraMessageColor = Avalonia.Media.Brushes.Green;
                 }
 
-                // Показываем оверлей и CAPTCHA
+                VitalMeasurement measurement;
                 IsOverlayVisible = true;
-                IsCaptchaVisible = true;
-                GenerateCaptcha();
+                if (IsStrictHardwareMode)
+                {
+                    IsCaptchaVisible = false;
+                    LogInfo("Start", "ESP32 runtime stage starting");
+                    measurement = await ExecuteMeasurementScenarioAsync(currentEmployee.Id, runCts.Token);
+                }
+                else
+                {
+                    IsCaptchaVisible = true;
+                    GenerateCaptcha();
+                    _measurementCompletion = new TaskCompletionSource<VitalMeasurement>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    var completionSource = _measurementCompletion;
+                    if (completionSource is null)
+                    {
+                        throw new InvalidOperationException("runtime state is null");
+                    }
 
-                // Ожидаем завершения измерений
-                _measurementCompletion = new TaskCompletionSource<VitalMeasurement>();
-                var measurement = await _measurementCompletion.Task;
+                    LogInfo("Start", "ESP32 runtime stage waiting for CAPTCHA-confirmed start.");
+                    measurement = await completionSource.Task.WaitAsync(runCts.Token);
+                }
+
+                if (measurement is null)
+                {
+                    throw new InvalidOperationException("measurement DTO is null");
+                }
+
+                if (!TryValidateRealMeasurement(measurement, out var validationMessage))
+                {
+                    ShowDetailedResult = false;
+                    HumanRecommendation = validationMessage;
+                    ResultMessage = validationMessage;
+                    ResultColor = Brushes.DarkOrange;
+                    HardwareSafetyStatus = "Измерение не удалось";
+                    LogWarning("Start", $"Runtime stage failed: {validationMessage}");
+                    return;
+                }
 
                 // Анализ и остальное
+                LogInfo("Start", "Save measurement starting");
                 var (verdict, verdictColor, healthTiles) = CalculateDetailedDiagnosis(measurement);
+                if (healthTiles is null)
+                {
+                    throw new InvalidOperationException("health tiles container is null");
+                }
+
                 DetailedHealthTiles = new ObservableCollection<HealthTile>(healthTiles);
                 VerdictColor = verdictColor;
                 UpdateTilesWithStatuses(healthTiles, verdict);
@@ -256,11 +351,28 @@ namespace SmartWatchProj.ViewModels
                 UpdateLastData();
                 ResultMessage = $"Результат: {verdict}";
                 ResultColor = verdictColor;
+                LogInfo("Start", "Start completed");
+            }
+            catch (OperationCanceledException)
+            {
+                ResultMessage = "Измерение прервано.";
+                ResultColor = Avalonia.Media.Brushes.DarkOrange;
+                HardwareSafetyStatus = "Аварийная остановка.";
+                LogWarning("Start", "Runtime stage failed: measurement cancelled.");
             }
             catch (Exception ex)
             {
-                ResultMessage = $"Ошибка: {ex.Message}";
+                var message = ex is NullReferenceException
+                    ? "Runtime stage failed: null dependency reached."
+                    : $"Runtime stage failed: {ex.Message}";
+                ResultMessage = $"Ошибка: {message}";
                 ResultColor = Avalonia.Media.Brushes.Red;
+                HardwareSafetyStatus = ex.Message.Contains("Timeout", StringComparison.OrdinalIgnoreCase)
+                    ? "Timeout"
+                    : ex.Message.Contains("авар", StringComparison.OrdinalIgnoreCase)
+                    ? "Аварийная остановка"
+                    : "Измерение прервано";
+                LogError("Start", message);
                 Console.WriteLine($"Исключение в Start(): {ex}");
             }
             finally
@@ -268,6 +380,11 @@ namespace SmartWatchProj.ViewModels
                 IsCollectingData = false;
                 StopCamera();
                 IsOverlayVisible = false;
+                IsCaptchaVisible = false;
+                _measurementCompletion = null;
+                measurementRunCts?.Dispose();
+                measurementRunCts = null;
+                OnPropertyChanged(nameof(CanEmergencyStop));
             }
         }
 
@@ -397,26 +514,212 @@ namespace SmartWatchProj.ViewModels
         {
             try
             {
-                var instructions = BuildMeasurementInstructions();
-                var totalSteps = instructions.Length;
-                var stepDelayMs = GetMeasurementStepDelayMs();
-
-                for (int i = 0; i < totalSteps; i++)
+                if (currentEmployeeId <= 0)
                 {
-                    CurrentInstruction = instructions[i];
-                    ProgressValue = (i / (double)totalSteps) * 100;
-                    await Task.Delay(stepDelayMs);
+                    throw new InvalidOperationException("employee not resolved");
                 }
 
-                ProgressValue = 100;
-                await Task.Delay(IsDiagnosticsModeEnabled ? 500 : 1000);
-
-                var measurement = await CaptureMeasurementAsync();
-                _measurementCompletion?.SetResult(measurement);
+                var cancellationToken = measurementRunCts?.Token ?? CancellationToken.None;
+                var measurement = await ExecuteMeasurementScenarioAsync(currentEmployeeId, cancellationToken);
+                _measurementCompletion?.TrySetResult(measurement);
+            }
+            catch (OperationCanceledException ex)
+            {
+                _measurementCompletion?.TrySetException(ex);
             }
             catch (Exception ex)
             {
-                _measurementCompletion?.SetException(ex);
+                _measurementCompletion?.TrySetException(ex);
+            }
+        }
+
+        private async Task<VitalMeasurement> ExecuteMeasurementScenarioAsync(int employeeId, CancellationToken cancellationToken)
+        {
+            if (employeeId <= 0)
+            {
+                throw new InvalidOperationException("employee not resolved");
+            }
+
+            var measurement = await CaptureMeasurementAsync(
+                employeeId,
+                cancellationToken,
+                new MeasurementWorkflowHooks
+                {
+                    OnStageAsync = HandleMeasurementWorkflowStageAsync
+                });
+            if (measurement is null)
+            {
+                throw new InvalidOperationException("measurement DTO is null");
+            }
+
+            LogInfo("Start", "Measurement scenario complete");
+            return measurement;
+        }
+
+        private async Task HandleMeasurementWorkflowStageAsync(MeasurementWorkflowStage stage, CancellationToken cancellationToken)
+        {
+            switch (stage)
+            {
+                case MeasurementWorkflowStage.PrepareTemperature:
+                    LogInfo("Start", "PrepareTemperature started");
+                    LogInfo("Start", "Подготовка к температуре");
+                    await RunPreparationStageAsync("Поднесите руку/лоб к датчику температуры", seconds: 3, progressStart: 0, progressEnd: 12, cancellationToken);
+                    LogInfo("Start", "PrepareTemperature completed");
+                    return;
+                case MeasurementWorkflowStage.MeasureTemperature:
+                    LogInfo("Start", "Temperature step starting");
+                    LogInfo("Start", "MeasureTemperature command sending");
+                    CurrentInstruction = "Измерение температуры";
+                    ProgressValue = 18;
+                    return;
+                case MeasurementWorkflowStage.PrepareAlcohol:
+                    LogInfo("Start", "PrepareAlcohol started");
+                    LogInfo("Start", "Подготовка к алкотестеру");
+                    await RunPreparationStageAsync("Подготовьтесь к измерению алкоголя и выполните продув", seconds: 4, progressStart: 22, progressEnd: 40, cancellationToken);
+                    LogInfo("Start", "PrepareAlcohol completed");
+                    return;
+                case MeasurementWorkflowStage.MeasureAlcohol:
+                    LogInfo("Start", "Alcohol step starting");
+                    CurrentInstruction = "Измерение алкоголя";
+                    ProgressValue = 46;
+                    return;
+                case MeasurementWorkflowStage.PreparePressure:
+                    LogInfo("Start", "PreparePressure started");
+                    LogInfo("Start", "Подготовка к давлению");
+                    await RunPreparationStageAsync("Наденьте манжету и не двигайтесь", seconds: 4, progressStart: 52, progressEnd: 72, cancellationToken);
+                    LogInfo("Start", "PreparePressure completed");
+                    return;
+                case MeasurementWorkflowStage.MeasurePressure:
+                    LogInfo("Start", "Pressure step starting");
+                    CurrentInstruction = "Измерение давления";
+                    ProgressValue = 78;
+                    return;
+                case MeasurementWorkflowStage.ProcessingResults:
+                    LogInfo("Start", "Обработка результатов");
+                    CurrentInstruction = "Обработка результатов";
+                    ProgressValue = 92;
+                    return;
+            }
+        }
+
+        private async Task RunPreparationStageAsync(
+            string prompt,
+            int seconds,
+            double progressStart,
+            double progressEnd,
+            CancellationToken cancellationToken)
+        {
+            if (seconds <= 0)
+            {
+                CurrentInstruction = prompt;
+                ProgressValue = progressEnd;
+                return;
+            }
+
+            for (var remaining = seconds; remaining >= 1; remaining--)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                LogInfo("Start", $"{prompt}: countdown tick {remaining}");
+                CurrentInstruction = $"{prompt}. Начало через {remaining} c.";
+                var progress = progressStart + ((seconds - remaining) / (double)seconds) * (progressEnd - progressStart);
+                ProgressValue = progress;
+                await Task.Delay(1000, cancellationToken);
+            }
+
+            CurrentInstruction = prompt;
+            ProgressValue = progressEnd;
+        }
+
+        private bool TryValidateRealMeasurement(VitalMeasurement measurement, out string message)
+        {
+            var issues = new List<string>();
+
+            if (measurement.Temperature < 34.0 || measurement.Temperature > 42.5)
+            {
+                issues.Add($"температура {measurement.Temperature:F2} выглядит как комнатная/нечеловеческая");
+            }
+
+            if (measurement.AlcoholLevel < 0 || measurement.AlcoholLevel > 5.0)
+            {
+                issues.Add($"алкоголь {measurement.AlcoholLevel:F2} выглядит как сырое/debug значение");
+            }
+
+            if (measurement.BloodPressureSystolic == 255 || measurement.BloodPressureDiastolic == 255)
+            {
+                issues.Add($"давление {measurement.BloodPressureSystolic:F0}/{measurement.BloodPressureDiastolic:F0} является debug-значением 255/255");
+            }
+            else if (measurement.BloodPressureSystolic < 70
+                || measurement.BloodPressureSystolic > 240
+                || measurement.BloodPressureDiastolic < 40
+                || measurement.BloodPressureDiastolic > 140
+                || measurement.BloodPressureDiastolic >= measurement.BloodPressureSystolic)
+            {
+                issues.Add($"давление {measurement.BloodPressureSystolic:F0}/{measurement.BloodPressureDiastolic:F0} не похоже на валидное измерение");
+            }
+
+            if (issues.Count == 0)
+            {
+                message = string.Empty;
+                return true;
+            }
+
+            message = $"Измерение не удалось: {string.Join("; ", issues)}. Повторите цикл с корректной подготовкой. Сырые значения: temp={measurement.Temperature:F2}, alco={measurement.AlcoholLevel:F2}, pressure={measurement.BloodPressureSystolic:F0}/{measurement.BloodPressureDiastolic:F0}.";
+            return false;
+        }
+
+        [RelayCommand]
+        private async Task EmergencyStop()
+        {
+            HardwareSafetyStatus = "Аварийная остановка.";
+            CurrentInstruction = "Аварийная остановка";
+            ResultMessage = "Измерение прервано / аварийная остановка.";
+            ResultColor = Brushes.Red;
+            ShowTopInfo("Старт временно заблокирован: выполнена аварийная остановка.", Brushes.Red);
+            LogWarning("Safety", "Emergency stop requested");
+
+            CancelMeasurementOperation("user emergency stop");
+            CancelPreflightOperation("user emergency stop");
+
+            try
+            {
+                if (hardwareMeasurementProvider is IEmergencyStoppableMeasurementProvider emergencyProvider)
+                {
+                    await emergencyProvider.EmergencyStopAsync("UI emergency stop");
+                    HardwareSafetyStatus = "Оборудование сброшено.";
+                    LogWarning("Safety", "Оборудование сброшено");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogError("Safety", $"Emergency stop failed: {ex.Message}");
+            }
+            finally
+            {
+                _measurementCompletion?.TrySetException(new OperationCanceledException("Emergency stop requested."));
+                IsCollectingData = false;
+                IsOverlayVisible = false;
+                IsCaptchaVisible = false;
+                ProgressValue = 0;
+                CurrentInstruction = "Оборудование сброшено";
+                OnPropertyChanged(nameof(CanEmergencyStop));
+            }
+        }
+
+        private void CancelMeasurementOperation(string reason)
+        {
+            if (measurementRunCts is { IsCancellationRequested: false })
+            {
+                LogWarning("Start", $"Measurement cancellation source = measurementRunCts; cancellation reason = {reason}");
+                measurementRunCts.Cancel();
+            }
+        }
+
+        private void CancelPreflightOperation(string reason)
+        {
+            if (preflightCts is { IsCancellationRequested: false })
+            {
+                LogWarning("Preflight", $"Cancellation source = preflightCts; cancellation reason = {reason}");
+                preflightCts.Cancel();
             }
         }
 
@@ -484,7 +787,13 @@ namespace SmartWatchProj.ViewModels
             var newEmployee = new Employee { Id = newId, Name = NewEmployeeName, CardId = NewCardId, FaceData = null };
             Employees.Add(newEmployee);
             SaveEmployeesToJson();
-            ShowTopInfo("Сотрудник добавлен", Brushes.Green);
+            CardId = newEmployee.CardId;
+            currentEmployeeId = newEmployee.Id;
+            IsEmployeeFound = true;
+            UpdateEmployeeStatus(newEmployee);
+            OnPropertyChanged(nameof(CanStartWorkflow));
+            OnPropertyChanged(nameof(StartAvailabilityReason));
+            ShowTopInfo("Сотрудник добавлен и подтверждён", Brushes.Green);
 
             // Очистить поля после добавления
             NewEmployeeName = string.Empty;
@@ -579,6 +888,13 @@ namespace SmartWatchProj.ViewModels
         [RelayCommand]
         private async Task SimulateCardRead()
         {
+            if (IsStrictHardwareMode)
+            {
+                ShowTopInfo("Симуляция пропуска отключена в strict production mode.", Brushes.Red);
+                LogWarning("CardReader", "Card simulation blocked in strict production mode.");
+                return;
+            }
+
             if (Employees.Any())
             {
                 var random = new Random();
@@ -1014,25 +1330,329 @@ namespace SmartWatchProj.ViewModels
         /// </summary>
         private void InitializeCapture()
         {
+            var devices = GetLinuxVideoDevices();
+            var selectedDevice = GetPrimaryLinuxVideoDevice(devices);
+
             try
             {
+                LogInfo("Camera", devices.Count == 0
+                    ? "Camera devices: none"
+                    : $"Camera devices: {string.Join(", ", devices)}");
+
+                if (OperatingSystem.IsLinux())
+                {
+                    LogInfo("Camera", $"Selected Linux camera device: {selectedDevice ?? "not found"} (backend V4L2).");
+
+                    if (!IsCurrentUserInLinuxGroup("video"))
+                    {
+                        LogWarning("Camera", $"Пользователь '{Environment.UserName}' не состоит в группе video. Доступ к {selectedDevice ?? "/dev/video0"} может быть ограничен.");
+                    }
+                }
+
+                if (OperatingSystem.IsLinux() && selectedDevice is null)
+                {
+                    LogError("Camera", "Основное Linux camera device /dev/video0 не найдено.");
+                    capture = null;
+                    return;
+                }
+
                 capture?.Dispose();
-                capture = new VideoCapture(0);  // Камера 0, измените индекс если нужно
+                capture = OperatingSystem.IsLinux()
+                    ? new VideoCapture(0, VideoCapture.API.V4L2)
+                    : new VideoCapture(0);
+
                 if (!capture.IsOpened)
                 {
-                    Console.WriteLine("Ошибка инициализации камеры.");
+                    LogError("Camera", OperatingSystem.IsLinux()
+                        ? $"Camera open failed: {selectedDevice ?? "/dev/video0"} via V4L2."
+                        : "Camera open failed.");
                     capture = null;
                 }
                 else
                 {
-                    Console.WriteLine("Камера инициализирована.");
+                    LogInfo("Camera", OperatingSystem.IsLinux()
+                        ? $"Camera open success: {selectedDevice ?? "/dev/video0"} via V4L2."
+                        : "Camera open success.");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Ошибка инициализации камеры: {ex.Message}");
+                LogError("Camera", OperatingSystem.IsLinux()
+                    ? $"Camera open failed: {selectedDevice ?? "/dev/video0"} via V4L2 ({ex.Message})"
+                    : $"Camera open failed: {ex.Message}");
                 capture = null;
+                return;
             }
+
+            if (capture is null || !capture.IsOpened)
+            {
+                return;
+            }
+
+            try
+            {
+                using var probeFrame = new Mat();
+                if (capture.Read(probeFrame) && !probeFrame.IsEmpty)
+                {
+                    LogInfo("Camera", $"Camera frame received: {probeFrame.Width}x{probeFrame.Height}.");
+                }
+                else
+                {
+                    LogWarning("Camera", $"Камера {selectedDevice ?? "device 0"} открылась, но первый кадр не получен.");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogError("Camera", $"Camera frame probe failed: {ex.Message}");
+            }
+        }
+
+        private sealed class PresenceCheckResult
+        {
+            public static PresenceCheckResult Verified() => new(true, false, "Пользователь верифицирован.");
+            public static PresenceCheckResult Rejected(string message) => new(false, false, message);
+            public static PresenceCheckResult TechnicalFailure(string message) => new(false, true, message);
+
+            private PresenceCheckResult(bool isVerified, bool shouldContinueWithoutCamera, string message)
+            {
+                IsVerified = isVerified;
+                ShouldContinueWithoutCamera = shouldContinueWithoutCamera;
+                Message = message;
+            }
+
+            public bool IsVerified { get; }
+            public bool ShouldContinueWithoutCamera { get; }
+            public string Message { get; }
+        }
+
+        private static string DescribeCameraProcessingNull(string stage, object? instance) =>
+            instance is null
+                ? $"Camera processing failed: {stage} is null."
+                : $"Camera processing failed: {stage}.";
+
+        private async Task<PresenceCheckResult> VerifyUserWithCamera()
+        {
+            LoadYoloModel();
+            InitializeCapture();
+
+            if (capture == null || !capture.IsOpened)
+            {
+                const string message = "Камера не инициализирована или недоступна.";
+                Console.WriteLine(message);
+                LogError("Presence", message);
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    ResultMessage = message;
+                    ResultColor = Avalonia.Media.Brushes.Red;
+                });
+                return PresenceCheckResult.TechnicalFailure(message);
+            }
+
+            if (yoloEngine == null)
+            {
+                const string message = "YOLO модель не загружена. Проверка невозможна.";
+                Console.WriteLine(message);
+                LogError("Presence", message);
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    ResultMessage = message;
+                    ResultColor = Avalonia.Media.Brushes.Red;
+                });
+                return PresenceCheckResult.TechnicalFailure(message);
+            }
+
+            var start = DateTime.UtcNow;
+            var timeout = TimeSpan.FromSeconds(20);
+            var attempts = 0;
+            var emptyFrameAttempts = 0;
+            var processingErrors = 0;
+            var cameraRotation = LoadDeviceRuntimeConfig().CameraRotation;
+            const int maxEmptyFrameAttempts = 12;
+            const int maxProcessingErrors = 5;
+
+            await Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                ResultMessage = "Контроль присутствия: убедитесь, что в кадре 1 человек.";
+                ResultColor = Avalonia.Media.Brushes.Black;
+            });
+
+            while (DateTime.UtcNow - start < timeout)
+            {
+                try
+                {
+                    using Mat frame = new Mat();
+                    if (!capture.Read(frame) || frame.IsEmpty)
+                    {
+                        emptyFrameAttempts++;
+                        attempts++;
+
+                        if (emptyFrameAttempts >= maxEmptyFrameAttempts)
+                        {
+                            const string noFrameMessage = "Камера открыта, но не отдаёт кадр. Проверка остановлена.";
+                            Console.WriteLine(noFrameMessage);
+                            LogError("Presence", noFrameMessage);
+                            await Dispatcher.UIThread.InvokeAsync(() =>
+                            {
+                                ResultMessage = noFrameMessage;
+                                ResultColor = Avalonia.Media.Brushes.Red;
+                            });
+                            return PresenceCheckResult.TechnicalFailure(noFrameMessage);
+                        }
+
+                        await Task.Delay(120);
+                        continue;
+                    }
+
+                    emptyFrameAttempts = 0;
+
+                    using var decodedBitmap = TryConvertMatToSkBitmap(frame);
+                    if (decodedBitmap is null)
+                    {
+                        processingErrors++;
+                        var decodeMessage = DescribeCameraProcessingNull("decodedBitmap", decodedBitmap);
+                        LogError("Presence", decodeMessage);
+
+                        if (processingErrors >= maxProcessingErrors)
+                        {
+                            await Dispatcher.UIThread.InvokeAsync(() =>
+                            {
+                                ResultMessage = "Не удалось преобразовать кадр камеры для проверки присутствия.";
+                                ResultColor = Avalonia.Media.Brushes.Red;
+                            });
+                            return PresenceCheckResult.TechnicalFailure(decodeMessage);
+                        }
+
+                        await Task.Delay(120);
+                        continue;
+                    }
+
+                    using var processedBitmap = ApplyCameraRotation(decodedBitmap, cameraRotation);
+                    if (processedBitmap is null)
+                    {
+                        processingErrors++;
+                        var rotationMessage = DescribeCameraProcessingNull("processedBitmap", processedBitmap);
+                        LogError("Presence", rotationMessage);
+                        if (processingErrors >= maxProcessingErrors)
+                        {
+                            return PresenceCheckResult.TechnicalFailure(rotationMessage);
+                        }
+
+                        await Task.Delay(120);
+                        continue;
+                    }
+
+                    if (cameraRotation == 180)
+                    {
+                        LogInfo("Camera", "Camera rotation applied: 180");
+                    }
+
+                    var results = yoloEngine.RunObjectDetection(processedBitmap, confidence: 0.5, iou: 0.45);
+                    if (results is null)
+                    {
+                        processingErrors++;
+                        var resultsMessage = DescribeCameraProcessingNull("yolo results", results);
+                        LogError("Presence", resultsMessage);
+                        if (processingErrors >= maxProcessingErrors)
+                        {
+                            return PresenceCheckResult.TechnicalFailure(resultsMessage);
+                        }
+
+                        await Task.Delay(120);
+                        continue;
+                    }
+
+                    processingErrors = 0;
+                    LogInfo("YOLO", $"Inference started on frame {frame.Width}x{frame.Height}.");
+
+                    var personResults = results
+                        .Where(r => string.Equals(r.Label?.Name, "person", StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+                    int personCount = personResults.Count(r => r.Confidence > 0.5);
+
+                    processedBitmap.Draw(personResults);
+                    LogInfo("Camera", $"Camera frame received. Attempt={attempts}, persons={personCount}.");
+
+                    var avaloniaBitmap = TryConvertSkBitmapToAvaloniaBitmap(processedBitmap);
+                    if (avaloniaBitmap is null)
+                    {
+                        processingErrors++;
+                        var bitmapMessage = DescribeCameraProcessingNull("preview encode", avaloniaBitmap);
+                        LogError("Presence", bitmapMessage);
+                        if (processingErrors >= maxProcessingErrors)
+                        {
+                            return PresenceCheckResult.TechnicalFailure(bitmapMessage);
+                        }
+
+                        await Task.Delay(120);
+                        continue;
+                    }
+
+                    await Dispatcher.UIThread.InvokeAsync(() =>
+                    {
+                        CameraFrame = avaloniaBitmap;
+
+                        if (personCount == 1)
+                        {
+                            ResultMessage = "Контроль присутствия: в кадре 1 человек — можно продолжать.";
+                            ResultColor = Avalonia.Media.Brushes.Green;
+                        }
+                        else if (personCount == 0)
+                        {
+                            ResultMessage = "Контроль присутствия: человек не обнаружен. Подойдите ближе и смотрите в камеру.";
+                            ResultColor = Avalonia.Media.Brushes.Orange;
+                        }
+                        else
+                        {
+                            ResultMessage = "Два или более человек в кадре. Посторонние выйдите из кадра.";
+                            ResultColor = Avalonia.Media.Brushes.Red;
+                        }
+                    });
+
+                    if (personCount == 1)
+                    {
+                        LogInfo("Presence", "Presence verified by camera and YOLO.");
+                        return PresenceCheckResult.Verified();
+                    }
+
+                    attempts++;
+                    await Task.Delay(120);
+                }
+                catch (Exception ex)
+                {
+                    processingErrors++;
+                    Console.WriteLine($"Ошибка в VerifyUserWithCamera: {ex.Message}. Stack: {ex.StackTrace}");
+
+                    if (processingErrors >= maxProcessingErrors)
+                    {
+                        var fatalMessage = $"Ошибка обработки камеры/YOLO: {ex.Message}";
+                        LogError("Presence", fatalMessage);
+                        await Dispatcher.UIThread.InvokeAsync(() =>
+                        {
+                            ResultMessage = fatalMessage;
+                            ResultColor = Avalonia.Media.Brushes.Red;
+                        });
+                        return PresenceCheckResult.TechnicalFailure(fatalMessage);
+                    }
+
+                    await Dispatcher.UIThread.InvokeAsync(() =>
+                    {
+                        ResultMessage = "Ошибка обработки камеры. Повтор попытки…";
+                        ResultColor = Avalonia.Media.Brushes.Orange;
+                    });
+
+                    await Task.Delay(120);
+                }
+            }
+
+            const string timeoutMessage = "Проверка завершена: за 20 секунд не удалось подтвердить присутствие одного человека.";
+            LogWarning("Presence", timeoutMessage);
+            await Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                ResultMessage = timeoutMessage;
+                ResultColor = Avalonia.Media.Brushes.Red;
+            });
+
+            return PresenceCheckResult.Rejected(timeoutMessage);
         }
 
         /// <summary>
@@ -1064,214 +1684,6 @@ namespace SmartWatchProj.ViewModels
         }
 
         /// <summary>
-        /// Проверка пользователя через камеру с YOLO (детекция людей).
-        /// </summary>
-        private async Task<bool> VerifyUserWithCamera()
-        {
-            LoadYoloModel();
-            InitializeCapture();
-
-            if (capture == null || !capture.IsOpened)
-            {
-                const string message = "Камера не инициализирована или недоступна.";
-                Console.WriteLine(message);
-                LogError("Presence", message);
-                await Dispatcher.UIThread.InvokeAsync(() =>
-                {
-                    ResultMessage = message;
-                    ResultColor = Avalonia.Media.Brushes.Red;
-                });
-                return false;
-            }
-
-            if (yoloEngine == null)
-            {
-                const string message = "YOLO модель не загружена. Проверка невозможна.";
-                Console.WriteLine(message);
-                LogError("Presence", message);
-                await Dispatcher.UIThread.InvokeAsync(() =>
-                {
-                    ResultMessage = message;
-                    ResultColor = Avalonia.Media.Brushes.Red;
-                });
-                return false;
-            }
-
-            var start = DateTime.UtcNow;
-            var timeout = TimeSpan.FromSeconds(20);
-            var attempts = 0;
-            var emptyFrameAttempts = 0;
-            var processingErrors = 0;
-            const int maxEmptyFrameAttempts = 12;
-            const int maxProcessingErrors = 5;
-
-            await Dispatcher.UIThread.InvokeAsync(() =>
-            {
-                ResultMessage = "Контроль присутствия: убедитесь, что в кадре 1 человек.";
-                ResultColor = Avalonia.Media.Brushes.Black;
-            });
-
-            while (DateTime.UtcNow - start < timeout)
-            {
-                try
-                {
-                    using Mat frame = new Mat();
-                    if (!capture.Read(frame) || frame.IsEmpty)
-                    {
-                        emptyFrameAttempts++;
-                        attempts++;
-
-                        if (emptyFrameAttempts >= maxEmptyFrameAttempts)
-                        {
-                            const string noFrameMessage = "Камера открыта, но не отдаёт кадр. Проверка остановлена.";
-                            Console.WriteLine(noFrameMessage);
-                            LogError("Presence", noFrameMessage);
-                            await Dispatcher.UIThread.InvokeAsync(() =>
-                            {
-                                ResultMessage = noFrameMessage;
-                                ResultColor = Avalonia.Media.Brushes.Red;
-                            });
-                            return false;
-                        }
-
-                        await Task.Delay(120);
-                        continue;
-                    }
-
-                    emptyFrameAttempts = 0;
-
-                    using VectorOfByte vec = new VectorOfByte();
-                    CvInvoke.Imencode(".jpg", frame, vec);
-                    byte[] jpegData = vec.ToArray();
-
-                    var decodedBitmap = SKBitmap.Decode(jpegData);
-                    if (decodedBitmap is null)
-                    {
-                        processingErrors++;
-                        if (processingErrors >= maxProcessingErrors)
-                        {
-                            const string decodeMessage = "Не удалось декодировать кадр камеры для проверки присутствия.";
-                            LogError("Presence", decodeMessage);
-                            await Dispatcher.UIThread.InvokeAsync(() =>
-                            {
-                                ResultMessage = decodeMessage;
-                                ResultColor = Avalonia.Media.Brushes.Red;
-                            });
-                            return false;
-                        }
-
-                        await Task.Delay(120);
-                        continue;
-                    }
-
-                    using (decodedBitmap)
-                    {
-                        var results = yoloEngine.RunObjectDetection(decodedBitmap, confidence: 0.5, iou: 0.45);
-                        processingErrors = 0;
-
-                        var personResults = results.Where(r => r.Label.Name == "person").ToList();
-                        int personCount = personResults.Count(r => r.Confidence > 0.5);
-
-                        decodedBitmap.Draw(personResults);
-                        Console.WriteLine($"Attempt {attempts}: Persons detected: {personCount}");
-
-                        using MemoryStream modifiedMs = new MemoryStream();
-                        decodedBitmap.Encode(modifiedMs, SKEncodedImageFormat.Jpeg, 100);
-                        modifiedMs.Seek(0, SeekOrigin.Begin);
-
-                        var avaloniaBitmap = new Avalonia.Media.Imaging.Bitmap(modifiedMs);
-                        await Dispatcher.UIThread.InvokeAsync(() =>
-                        {
-                            CameraFrame = avaloniaBitmap;
-
-                            if (personCount == 1)
-                            {
-                                ResultMessage = "Контроль присутствия: в кадре 1 человек — можно продолжать.";
-                                ResultColor = Avalonia.Media.Brushes.Green;
-                            }
-                            else if (personCount == 0)
-                            {
-                                ResultMessage = "Контроль присутствия: человек не обнаружен. Подойдите ближе и смотрите в камеру.";
-                                ResultColor = Avalonia.Media.Brushes.Orange;
-                            }
-                            else
-                            {
-                                ResultMessage = "Два или более человек в кадре. Посторонние выйдите из кадра.";
-                                ResultColor = Avalonia.Media.Brushes.Red;
-                            }
-                        });
-
-                        if (personCount == 1)
-                        {
-                            LogInfo("Presence", "Presence verified by camera and YOLO.");
-                            return true;
-                        }
-                    }
-
-                    attempts++;
-                    await Task.Delay(120);
-                }
-                catch (Exception ex)
-                {
-                    processingErrors++;
-                    Console.WriteLine($"Ошибка в VerifyUserWithCamera: {ex.Message}. Stack: {ex.StackTrace}");
-
-                    if (processingErrors >= maxProcessingErrors)
-                    {
-                        var fatalMessage = $"Ошибка обработки камеры/YOLO: {ex.Message}";
-                        LogError("Presence", fatalMessage);
-                        await Dispatcher.UIThread.InvokeAsync(() =>
-                        {
-                            ResultMessage = fatalMessage;
-                            ResultColor = Avalonia.Media.Brushes.Red;
-                        });
-                        return false;
-                    }
-
-                    await Dispatcher.UIThread.InvokeAsync(() =>
-                    {
-                        ResultMessage = "Ошибка обработки камеры. Повтор попытки…";
-                        ResultColor = Avalonia.Media.Brushes.Orange;
-                    });
-
-                    await Task.Delay(120);
-                }
-            }
-
-            const string timeoutMessage = "Проверка завершена: за 20 секунд не удалось подтвердить присутствие одного человека.";
-            LogWarning("Presence", timeoutMessage);
-            await Dispatcher.UIThread.InvokeAsync(() =>
-            {
-                ResultMessage = timeoutMessage;
-                ResultColor = Avalonia.Media.Brushes.Red;
-            });
-
-            return false;
-        }
-
-        /// <summary>
-        /// Конвертер Mat в Avalonia Bitmap (с использованием временного файла).
-        /// </summary>
-        private Avalonia.Media.Imaging.Bitmap ToAvaloniaBitmap(Mat mat)
-        {
-            var tempPath = Path.GetTempFileName() + ".png"; // Временный файл
-            try
-            {
-                CvInvoke.Imwrite(tempPath, mat); // Сохраняем Mat как PNG
-
-                using var fs = new FileStream(tempPath, FileMode.Open, FileAccess.Read);
-                return new Avalonia.Media.Imaging.Bitmap(fs);
-            }
-            finally
-            {
-                if (File.Exists(tempPath))
-                {
-                    File.Delete(tempPath); // Удаляем временный файл
-                }
-            }
-        }
-
-        /// <summary>
         /// Остановка камеры.
         /// </summary>
         private void StopCamera()
@@ -1280,8 +1692,163 @@ namespace SmartWatchProj.ViewModels
             {
                 capture.Dispose();
                 capture = null;
-                Console.WriteLine("Камера остановлена.");
+                LogInfo("Camera", "Камера остановлена.");
             }
+        }
+
+        private static List<string> GetLinuxVideoDevices()
+        {
+            if (!OperatingSystem.IsLinux() || !Directory.Exists("/dev"))
+            {
+                return new List<string>();
+            }
+
+            return Directory.GetFiles("/dev", "video*")
+                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private static string? GetPrimaryLinuxVideoDevice(IReadOnlyList<string> devices)
+        {
+            if (!OperatingSystem.IsLinux())
+            {
+                return null;
+            }
+
+            return devices.FirstOrDefault(path => string.Equals(path, "/dev/video0", StringComparison.Ordinal))
+                ?? devices.FirstOrDefault();
+        }
+
+        private static bool IsCurrentUserInLinuxGroup(string groupName)
+        {
+            if (!OperatingSystem.IsLinux())
+            {
+                return true;
+            }
+
+            try
+            {
+                var userName = Environment.UserName;
+                foreach (var line in File.ReadLines("/etc/group"))
+                {
+                    if (string.IsNullOrWhiteSpace(line) || line.StartsWith('#'))
+                    {
+                        continue;
+                    }
+
+                    var parts = line.Split(':');
+                    if (parts.Length < 4 || !string.Equals(parts[0], groupName, StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    return parts[3]
+                        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                        .Contains(userName, StringComparer.Ordinal);
+                }
+            }
+            catch
+            {
+            }
+
+            return false;
+        }
+
+        private static SKBitmap? TryConvertMatToSkBitmap(Mat frame)
+        {
+            try
+            {
+                using var rgba = new Mat();
+                var conversion = frame.NumberOfChannels switch
+                {
+                    1 => ColorConversion.Gray2Rgba,
+                    3 => ColorConversion.Bgr2Rgba,
+                    4 => ColorConversion.Bgra2Rgba,
+                    _ => ColorConversion.Bgr2Rgba
+                };
+
+                CvInvoke.CvtColor(frame, rgba, conversion);
+
+                var info = new SKImageInfo(rgba.Width, rgba.Height, SKColorType.Rgba8888, SKAlphaType.Unpremul);
+                var bitmap = new SKBitmap(info);
+                var byteCount = checked((int)(rgba.Step * rgba.Rows));
+                var buffer = new byte[byteCount];
+                Marshal.Copy(rgba.DataPointer, buffer, 0, byteCount);
+                Marshal.Copy(buffer, 0, bitmap.GetPixels(), byteCount);
+                return bitmap;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static Avalonia.Media.Imaging.Bitmap? TryConvertSkBitmapToAvaloniaBitmap(SKBitmap? bitmap)
+        {
+            if (bitmap is null || bitmap.IsEmpty)
+            {
+                return null;
+            }
+
+            using var image = SKImage.FromBitmap(bitmap);
+            if (image is null)
+            {
+                return null;
+            }
+
+            using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+            if (data is null || data.Size <= 0)
+            {
+                return null;
+            }
+
+            using var stream = new MemoryStream(data.ToArray());
+            return new Avalonia.Media.Imaging.Bitmap(stream);
+        }
+
+        private static SKBitmap ApplyCameraRotation(SKBitmap source, int cameraRotation)
+        {
+            if (cameraRotation != 180)
+            {
+                return source.Copy();
+            }
+
+            var rotated = new SKBitmap(source.Width, source.Height, source.ColorType, source.AlphaType);
+            using var canvas = new SKCanvas(rotated);
+            canvas.Translate(source.Width, source.Height);
+            canvas.RotateDegrees(180);
+            canvas.DrawBitmap(source, 0, 0);
+            canvas.Flush();
+            return rotated;
+        }
+
+        private DeviceRuntimeConfig LoadDeviceRuntimeConfig()
+        {
+            var configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, DeviceConfigFileName);
+            if (!File.Exists(configPath))
+            {
+                return new DeviceRuntimeConfig();
+            }
+
+            try
+            {
+                var json = File.ReadAllText(configPath);
+                return JsonSerializer.Deserialize<DeviceRuntimeConfig>(json, new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                }) ?? new DeviceRuntimeConfig();
+            }
+            catch (Exception ex)
+            {
+                LogWarning("Config", $"Failed to read {DeviceConfigFileName}: {ex.Message}");
+                return new DeviceRuntimeConfig();
+            }
+        }
+
+        private sealed class DeviceRuntimeConfig
+        {
+            public int CameraRotation { get; init; }
+            public bool LinuxNoCameraMode { get; init; }
         }
 
         
