@@ -56,7 +56,7 @@
     <PackageReference Include="LiveChartsCore.SkiaSharpView.Avalonia" Version="2.0.0-rc6.1" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.0" />
     <PackageReference Include="Microsoft.ML" Version="3.0.1" />
-    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.19.2" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.22.1" />
     <PackageReference Include="Microsoft.ML.OnnxTransformer" Version="3.0.1" />
     <PackageReference Include="Microsoft.ML.Vision" Version="3.0.1" />
     <PackageReference Include="PdfSharpCore" Version="1.3.67" />
@@ -66,4 +66,22 @@
     <PackageReference Include="System.Net.Http" Version="4.3.4" />
     <PackageReference Include="YoloDotNet" Version="3.1.1" />
   </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Update="Microsoft.ML.OnnxRuntime.Gpu" ExcludeAssets="all" PrivateAssets="all" />
+    <PackageReference Update="Microsoft.ML.OnnxRuntime.Gpu.Linux" ExcludeAssets="all" PrivateAssets="all" />
+    <PackageReference Update="Microsoft.ML.OnnxRuntime.Gpu.Windows" ExcludeAssets="all" PrivateAssets="all" />
+  </ItemGroup>
+
+  <Target Name="RemoveWinX64OnnxRuntimeFromLinuxPublish"
+          BeforeTargets="_HandleFileConflictsForPublish"
+          Condition="'$(RuntimeIdentifier)' == 'linux-x64'">
+    <ItemGroup>
+      <_WinX64OnnxRuntimePublishFiles Include="@(ResolvedFileToPublish)"
+                                     Condition="$([System.String]::Copy('%(ResolvedFileToPublish.Identity)').Replace('\', '/').Contains('/runtimes/win-x64/native/'))
+                                     and $([System.String]::Copy('%(ResolvedFileToPublish.Filename)').ToLowerInvariant().StartsWith('onnxruntime'))
+                                     and '%(ResolvedFileToPublish.Extension)' == '.dll'" />
+      <ResolvedFileToPublish Remove="@(_WinX64OnnxRuntimePublishFiles)" />
+    </ItemGroup>
+  </Target>
 </Project>

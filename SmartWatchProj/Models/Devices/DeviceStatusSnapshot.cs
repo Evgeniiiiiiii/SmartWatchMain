@@ -12,18 +12,18 @@ namespace SmartWatchProj.Models.Devices
         public DeviceReadinessState State { get; init; }
         public bool IsBlocking { get; init; }
 
-        public string StateText => StatusLabel ?? (State switch
+        public string StateText => State switch
         {
-            DeviceReadinessState.Ready => "Готово",
-            DeviceReadinessState.Warning => "Не готово",
-            DeviceReadinessState.Missing => "Не найдено",
-            DeviceReadinessState.Error => "Ошибка",
-            DeviceReadinessState.Diagnostics => "Fallback",
-            DeviceReadinessState.Unavailable => "Недоступно",
-            DeviceReadinessState.Skipped => "Пропущено",
-            DeviceReadinessState.Disabled => "Отключено",
-            _ => "Не проверено"
-        });
+            DeviceReadinessState.Ready => "ready",
+            DeviceReadinessState.Warning => "warning",
+            DeviceReadinessState.Missing => "missing",
+            DeviceReadinessState.Error => "error",
+            DeviceReadinessState.Diagnostics => "fallback",
+            DeviceReadinessState.Unavailable => "unavailable",
+            DeviceReadinessState.Skipped => "skipped",
+            DeviceReadinessState.Disabled => "disabled",
+            _ => "unknown"
+        };
 
         public IBrush AccentBrush => State switch
         {

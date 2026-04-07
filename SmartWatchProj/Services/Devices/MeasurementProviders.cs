@@ -116,11 +116,34 @@ namespace SmartWatchProj.Services.Devices
         private const string TemperatureCommand = "x1x1x";
         private const string AlcoholCommand = "x1x2x";
         private const string PressureCommand = "x1x3x";
-        private static readonly Regex TemperatureRegex = new(@"IRTemperature\s*=\s*(?<value>-?\d+(?:[.,]\d+)?)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-        private static readonly Regex AlcoholRegex = new(@"Alco\s+value\s*=\s*(?<value>-?\d+(?:[.,]\d+)?)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-        private static readonly Regex SadRegex = new(@"NIBP\s+SAD\s*=\s*(?<value>-?\d+(?:[.,]\d+)?)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-        private static readonly Regex DadRegex = new(@"NIBP\s+DAD\s*=\s*(?<value>-?\d+(?:[.,]\d+)?)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-        private static readonly Regex PressureCompleteRegex = new(@"NIBP\s+measure\s+is\s+complete", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        private const double MinimumHumanTemperature = 30.0;
+        private const double InvalidAlcoholRawThreshold = 4095.0;
+        private static readonly Regex[] TemperatureRegexes =
+        {
+            new(@"IRTemperature\s*[:=]\s*(?<value>-?\d+(?:[.,]\d+)?)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),
+            new(@"\b(?:IR\s*)?Temp(?:erature)?\b\s*[:=]\s*(?<value>-?\d+(?:[.,]\d+)?)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)
+        };
+        private static readonly Regex[] AlcoholRegexes =
+        {
+            new(@"Alco\s+value\s*[:=]\s*(?<value>-?\d+(?:[.,]\d+)?)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),
+            new(@"\bAlco(?:hol)?(?:\s+value)?\b\s*[:=]\s*(?<value>-?\d+(?:[.,]\d+)?)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)
+        };
+        private static readonly Regex[] SadRegexes =
+        {
+            new(@"NIBP\s+(?:SAD|SYS)\s*[:=]\s*(?<value>-?\d+(?:[.,]\d+)?)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),
+            new(@"\b(?:SAD|SYS)\b\s*[:=]\s*(?<value>-?\d+(?:[.,]\d+)?)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)
+        };
+        private static readonly Regex[] DadRegexes =
+        {
+            new(@"NIBP\s+(?:DAD|DIA)\s*[:=]\s*(?<value>-?\d+(?:[.,]\d+)?)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),
+            new(@"\b(?:DAD|DIA)\b\s*[:=]\s*(?<value>-?\d+(?:[.,]\d+)?)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)
+        };
+        private static readonly Regex[] PressureCompleteRegexes =
+        {
+            new(@"NIBP\s+measure\s+is\s+complete", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),
+            new(@"\bNIBP\b.*\bcomplete\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),
+            new(@"\bpressure\b.*\bcomplete\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)
+        };
         private static readonly Regex FinalJsonRegex = new(@"\{[^\{\}]*?(Temp|\""Temp\"")\s*:\s*[-\d.,]+[^\{\}]*?(Alco|\""Alco\"")\s*:\s*[-\d.,]+[^\{\}]*?(SYS|\""SYS\"")\s*:\s*[-\d.,]+[^\{\}]*?(DAD|\""DAD\"")\s*:\s*[-\d.,]+[^\{\}]*\}", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Singleline);
 
         private readonly string baseDirectory;
@@ -280,37 +303,72 @@ namespace SmartWatchProj.Services.Devices
         {
             await ReportStageAsync(hooks, MeasurementWorkflowStage.PrepareTemperature, cancellationToken);
             await ReportStageAsync(hooks, MeasurementWorkflowStage.MeasureTemperature, cancellationToken);
+            await WaitForMeasurementWindowAsync("temperature", controller.TemperaturePreparationDelayMs, cancellationToken);
             await SendControllerCommandAsync(port, TemperatureCommand, controller.DelayBetweenCommandsMs, cancellationToken);
-            var temperaturePayload = await ReadUntilMatchAsync(port, controller.TemperatureTimeoutMs, cancellationToken, "IRTemperature", TemperatureRegex);
-            var temperature = ParseMatchedDouble(temperaturePayload, TemperatureRegex, "temperature");
-            logStore.Info("COM", $"Parsed temperature: {temperature}");
+            var temperatureRead = await ReadOptionalMeasurementDebugAsync(port, controller.TemperatureTimeoutMs, cancellationToken, "temperature debug", TemperatureRegexes);
+            var temperature = TryParseMatchedDouble(temperatureRead.Payload, TemperatureRegexes, out var parsedTemperature)
+                ? parsedTemperature
+                : (double?)null;
+            if (temperature is <= MinimumHumanTemperature)
+            {
+                logStore.Warning("COM", $"Temperature looks not ready yet: {temperature}. Waiting {controller.TemperatureRetryDelayMs} ms and retrying x1x1x once.");
+                await WaitForMeasurementWindowAsync("temperature retry", controller.TemperatureRetryDelayMs, cancellationToken);
+                await SendControllerCommandAsync(port, TemperatureCommand, controller.DelayBetweenCommandsMs, cancellationToken);
+                temperatureRead = await ReadOptionalMeasurementDebugAsync(port, controller.TemperatureTimeoutMs, cancellationToken, "temperature debug retry", TemperatureRegexes);
+                temperature = TryParseMatchedDouble(temperatureRead.Payload, TemperatureRegexes, out parsedTemperature)
+                    ? parsedTemperature
+                    : null;
+            }
+
+            if (temperature.HasValue)
+            {
+                logStore.Info("COM", $"Parsed temperature: {temperature.Value}");
+            }
+            else
+            {
+                logStore.Warning("COM", "Temperature debug value not received within timeout. Continuing and waiting for final JSON.");
+            }
 
             await ReportStageAsync(hooks, MeasurementWorkflowStage.PrepareAlcohol, cancellationToken);
             await ReportStageAsync(hooks, MeasurementWorkflowStage.MeasureAlcohol, cancellationToken);
+            await WaitForMeasurementWindowAsync("alcohol", controller.AlcoholPreparationDelayMs, cancellationToken);
             await SendControllerCommandAsync(port, AlcoholCommand, controller.DelayBetweenCommandsMs, cancellationToken);
-            var alcoholPayload = await ReadUntilMatchAsync(port, controller.AlcoholTimeoutMs, cancellationToken, "Alco value", AlcoholRegex);
-            var alcohol = ParseMatchedDouble(alcoholPayload, AlcoholRegex, "alco");
-            logStore.Info("COM", $"Parsed alco: {alcohol}");
+            var alcoholRead = await ReadOptionalMeasurementDebugAsync(port, controller.AlcoholTimeoutMs, cancellationToken, "alcohol debug", AlcoholRegexes);
+            var alcohol = TryParseMatchedDouble(alcoholRead.Payload, AlcoholRegexes, out var parsedAlcohol)
+                ? parsedAlcohol
+                : (double?)null;
+            if (alcohol >= InvalidAlcoholRawThreshold)
+            {
+                logStore.Warning("COM", $"Alcohol sensor still returns raw value {alcohol}. Waiting {controller.AlcoholRetryDelayMs} ms and retrying x1x2x once.");
+                await WaitForMeasurementWindowAsync("alcohol retry", controller.AlcoholRetryDelayMs, cancellationToken);
+                await SendControllerCommandAsync(port, AlcoholCommand, controller.DelayBetweenCommandsMs, cancellationToken);
+                alcoholRead = await ReadOptionalMeasurementDebugAsync(port, controller.AlcoholTimeoutMs, cancellationToken, "alcohol debug retry", AlcoholRegexes);
+                alcohol = TryParseMatchedDouble(alcoholRead.Payload, AlcoholRegexes, out parsedAlcohol)
+                    ? parsedAlcohol
+                    : null;
+            }
+
+            if (alcohol.HasValue)
+            {
+                logStore.Info("COM", $"Parsed alco: {alcohol.Value}");
+            }
+            else
+            {
+                logStore.Warning("COM", "Alcohol debug value not received within timeout. Continuing and waiting for final JSON.");
+            }
 
             await ReportStageAsync(hooks, MeasurementWorkflowStage.PreparePressure, cancellationToken);
             await ReportStageAsync(hooks, MeasurementWorkflowStage.MeasurePressure, cancellationToken);
+            await WaitForMeasurementWindowAsync("pressure cuff preparation", controller.PressurePreparationDelayMs, cancellationToken);
             await SendControllerCommandAsync(port, PressureCommand, controller.DelayBetweenCommandsMs, cancellationToken);
-            var pressurePayload = await ReadUntilAllMatchesAsync(
+            var pressureReadResult = await ReadPressureAndTryFinalJsonAsync(
                 port,
                 controller.PressureTimeoutMs,
+                controller.FinalJsonTimeoutMs,
                 cancellationToken,
-                "NIBP completion + SAD + DAD",
-                PressureCompleteRegex,
-                SadRegex,
-                DadRegex);
-
-            var sad = ParseMatchedDouble(pressurePayload, SadRegex, "SAD");
-            var dad = ParseMatchedDouble(pressurePayload, DadRegex, "DAD");
-            logStore.Info("COM", $"Parsed SAD: {sad}");
-            logStore.Info("COM", $"Parsed DAD: {dad}");
-
+                "NIBP completion + SAD + DAD");
             await ReportStageAsync(hooks, MeasurementWorkflowStage.ProcessingResults, cancellationToken);
-            var finalJsonPayload = await TryReadFinalJsonAsync(port, controller.FinalJsonTimeoutMs, cancellationToken);
+            var finalJsonPayload = pressureReadResult.FinalJsonPayload;
             if (!string.IsNullOrWhiteSpace(finalJsonPayload))
             {
                 logStore.Info("COM", $"Final raw payload: {finalJsonPayload}");
@@ -325,14 +383,110 @@ namespace SmartWatchProj.Services.Devices
                     BuildResultSummary(finalJson.Temp, finalJson.Alco, finalJson.Sys, finalJson.Dad, fromFinalJson: true));
             }
 
+            var temperatureValue = RequireMeasurementValue(temperature, "temperature");
+            var alcoholValue = RequireMeasurementValue(alcohol, "alco");
+            var pressurePayload = pressureReadResult.PressurePayload;
+            var sad = ParseMatchedDouble(pressurePayload, SadRegexes, "SAD");
+            var dad = ParseMatchedDouble(pressurePayload, DadRegexes, "DAD");
+            logStore.Info("COM", $"Parsed SAD: {sad}");
+            logStore.Info("COM", $"Parsed DAD: {dad}");
             logStore.Warning("COM", "JSON parse failed: final controller JSON not received, falling back to debug/raw readings.");
             return new ControllerResponse(
-                temperature,
-                alcohol,
+                temperatureValue,
+                alcoholValue,
                 sad,
                 dad,
                 "debug-raw",
-                BuildResultSummary(temperature, alcohol, sad, dad, fromFinalJson: false));
+                BuildResultSummary(temperatureValue, alcoholValue, sad, dad, fromFinalJson: false));
+        }
+
+        private async Task<PressureAndFinalJsonReadResult> ReadPressureAndTryFinalJsonAsync(
+            SerialPort port,
+            int pressureTimeoutMs,
+            int finalJsonTimeoutMs,
+            CancellationToken cancellationToken,
+            string expectedLabel)
+        {
+            var effectivePressureTimeoutMs = Math.Max(pressureTimeoutMs, 35000);
+            var pressureDeadline = DateTime.UtcNow.AddMilliseconds(effectivePressureTimeoutMs);
+            var finalJsonDeadline = pressureDeadline.AddMilliseconds(finalJsonTimeoutMs);
+            var combinedBuffer = string.Empty;
+            var pressurePayload = string.Empty;
+            var pressureComplete = false;
+            string? lastParseFailureReason = null;
+
+            logStore.Info("COM", $"Pressure step waiting up to {effectivePressureTimeoutMs} ms for pressure/final JSON data.");
+
+            while (DateTime.UtcNow < finalJsonDeadline)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var chunk = port.ReadExisting();
+                if (!string.IsNullOrEmpty(chunk))
+                {
+                    logStore.Info("COM", $"Raw chunk: {chunk}");
+                    combinedBuffer += chunk;
+                    logStore.Info("COM", $"Current accumulated pressure buffer: {combinedBuffer}");
+
+                    if (!pressureComplete && TryParseFinalJsonCandidate(combinedBuffer, ref lastParseFailureReason, out var finalJsonCandidate))
+                    {
+                        logStore.Info("COM", "Pressure step accepted final JSON without requiring legacy NIBP debug logs.");
+                        return new PressureAndFinalJsonReadResult(pressurePayload, finalJsonCandidate);
+                    }
+
+                    if (!pressureComplete && HasMatch(combinedBuffer, PressureCompleteRegexes) && HasMatch(combinedBuffer, SadRegexes) && HasMatch(combinedBuffer, DadRegexes))
+                    {
+                        pressureComplete = true;
+                        pressurePayload = combinedBuffer;
+
+                        var seededFinalBuffer = BuildFinalJsonSeedBuffer(combinedBuffer);
+                        if (!string.IsNullOrWhiteSpace(seededFinalBuffer))
+                        {
+                            logStore.Info("COM", $"Final JSON buffer updated: {seededFinalBuffer}");
+                            if (TryParseFinalJsonFromAccumulatedBuffer(ref seededFinalBuffer, ref lastParseFailureReason, out var inlineCandidate))
+                            {
+                                return new PressureAndFinalJsonReadResult(pressurePayload, inlineCandidate);
+                            }
+                        }
+                    }
+                    else if (pressureComplete)
+                    {
+                        var currentFinalBuffer = BuildFinalJsonSeedBuffer(combinedBuffer);
+                        logStore.Info("COM", $"Final JSON chunk received: {chunk}");
+                        logStore.Info("COM", $"Final JSON buffer updated: {currentFinalBuffer}");
+                        if (TryParseFinalJsonFromAccumulatedBuffer(ref currentFinalBuffer, ref lastParseFailureReason, out var candidate))
+                        {
+                            return new PressureAndFinalJsonReadResult(pressurePayload, candidate);
+                        }
+                    }
+                }
+
+                if (!pressureComplete)
+                {
+                    if (DateTime.UtcNow >= pressureDeadline)
+                    {
+                        throw new TimeoutException($"ESP32 controller did not return pressure logs or final JSON within {effectivePressureTimeoutMs} ms. Payload={combinedBuffer}");
+                    }
+                }
+                else if (DateTime.UtcNow >= finalJsonDeadline)
+                {
+                    break;
+                }
+
+                await Task.Delay(100, cancellationToken);
+            }
+
+            if (!pressureComplete)
+            {
+                throw new TimeoutException($"ESP32 controller did not return pressure logs or final JSON within {effectivePressureTimeoutMs} ms. Payload={combinedBuffer}");
+            }
+
+            if (!string.IsNullOrWhiteSpace(lastParseFailureReason))
+            {
+                logStore.Warning("COM", $"Final JSON parse failed with reason: timeout after parse error ({lastParseFailureReason})");
+            }
+
+            return new PressureAndFinalJsonReadResult(pressurePayload, null);
         }
 
         private static Task ReportStageAsync(
@@ -425,12 +579,12 @@ namespace SmartWatchProj.Services.Devices
             }
         }
 
-        private async Task<string> ReadUntilMatchAsync(
+        private async Task<OptionalDebugReadResult> ReadOptionalMeasurementDebugAsync(
             SerialPort port,
             int timeoutMs,
             CancellationToken cancellationToken,
             string expectedLabel,
-            Regex pattern)
+            params Regex[] patterns)
         {
             var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
             var buffer = string.Empty;
@@ -444,16 +598,17 @@ namespace SmartWatchProj.Services.Devices
                 {
                     logStore.Info("COM", $"Raw chunk: {chunk}");
                     buffer += chunk;
-                    if (pattern.IsMatch(buffer))
+                    if (HasMatch(buffer, patterns))
                     {
-                        return buffer;
+                        return new OptionalDebugReadResult(buffer, true);
                     }
                 }
 
                 await Task.Delay(100, cancellationToken);
             }
 
-            throw new TimeoutException($"ESP32 controller did not return {expectedLabel} within {timeoutMs} ms. Payload={buffer}");
+            logStore.Warning("COM", $"ESP32 controller did not return optional {expectedLabel} within {timeoutMs} ms. Payload={buffer}");
+            return new OptionalDebugReadResult(buffer, false);
         }
 
         private async Task<string> ReadUntilAllMatchesAsync(
@@ -490,10 +645,21 @@ namespace SmartWatchProj.Services.Devices
         private async Task<string?> TryReadFinalJsonAsync(
             SerialPort port,
             int timeoutMs,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            string? seedBuffer = null)
         {
             var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
-            var buffer = string.Empty;
+            var buffer = BuildFinalJsonSeedBuffer(seedBuffer);
+            string? lastParseFailureReason = null;
+
+            if (!string.IsNullOrWhiteSpace(buffer))
+            {
+                logStore.Info("COM", $"Final JSON buffer updated: {buffer}");
+                if (TryParseFinalJsonFromAccumulatedBuffer(ref buffer, ref lastParseFailureReason, out var seededCandidate))
+                {
+                    return seededCandidate;
+                }
+            }
 
             while (DateTime.UtcNow < deadline)
             {
@@ -502,19 +668,148 @@ namespace SmartWatchProj.Services.Devices
                 var chunk = port.ReadExisting();
                 if (!string.IsNullOrEmpty(chunk))
                 {
-                    logStore.Info("COM", $"Raw chunk: {chunk}");
+                    logStore.Info("COM", $"Final JSON chunk received: {chunk}");
                     buffer += chunk;
-                    var jsonMatch = FinalJsonRegex.Match(buffer);
-                    if (jsonMatch.Success)
+                    logStore.Info("COM", $"Final JSON buffer updated: {buffer}");
+                    if (TryParseFinalJsonFromAccumulatedBuffer(ref buffer, ref lastParseFailureReason, out var candidate))
                     {
-                        return jsonMatch.Value;
+                        return candidate;
                     }
                 }
 
                 await Task.Delay(100, cancellationToken);
             }
 
+            if (!string.IsNullOrWhiteSpace(lastParseFailureReason))
+            {
+                logStore.Warning("COM", $"Final JSON parse failed with reason: timeout after parse error ({lastParseFailureReason})");
+            }
+
             return null;
+        }
+
+        private bool TryParseFinalJsonFromAccumulatedBuffer(ref string buffer, ref string? lastParseFailureReason, out string candidate)
+        {
+            candidate = string.Empty;
+
+            if (!TryExtractJsonCandidate(buffer, out candidate, out var remainingBuffer))
+            {
+                return false;
+            }
+
+            logStore.Info("COM", $"Final JSON candidate detected: {candidate}");
+
+            try
+            {
+                _ = ParseFinalJsonPayload(candidate);
+                logStore.Info("COM", "Final JSON parse success");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                lastParseFailureReason = ex.Message;
+                logStore.Warning("COM", $"Final JSON parse failed with reason: {ex.Message}");
+                buffer = remainingBuffer;
+                candidate = string.Empty;
+                return false;
+            }
+        }
+
+        private async Task WaitForMeasurementWindowAsync(string stage, int delayMs, CancellationToken cancellationToken)
+        {
+            if (delayMs <= 0)
+            {
+                return;
+            }
+
+            logStore.Info("COM", $"Waiting {delayMs} ms before {stage} measurement.");
+            await Task.Delay(delayMs, cancellationToken);
+        }
+
+        private static bool TryExtractJsonCandidate(string buffer, out string candidate, out string remainingBuffer)
+        {
+            candidate = string.Empty;
+            remainingBuffer = buffer;
+
+            if (string.IsNullOrWhiteSpace(buffer))
+            {
+                return false;
+            }
+
+            var startIndex = buffer.IndexOf('{');
+            if (startIndex < 0)
+            {
+                return false;
+            }
+
+            var braceDepth = 0;
+            var inString = false;
+            var escapeNext = false;
+
+            for (var index = startIndex; index < buffer.Length; index++)
+            {
+                var current = buffer[index];
+
+                if (escapeNext)
+                {
+                    escapeNext = false;
+                    continue;
+                }
+
+                if (current == '\\' && inString)
+                {
+                    escapeNext = true;
+                    continue;
+                }
+
+                if (current == '"')
+                {
+                    inString = !inString;
+                    continue;
+                }
+
+                if (inString)
+                {
+                    continue;
+                }
+
+                if (current == '{')
+                {
+                    braceDepth++;
+                    continue;
+                }
+
+                if (current != '}')
+                {
+                    continue;
+                }
+
+                braceDepth--;
+                if (braceDepth != 0)
+                {
+                    continue;
+                }
+
+                candidate = buffer.Substring(startIndex, index - startIndex + 1);
+                remainingBuffer = buffer[(index + 1)..];
+                return true;
+            }
+
+            remainingBuffer = buffer[startIndex..];
+            return false;
+        }
+
+        private static string BuildFinalJsonSeedBuffer(string? seedBuffer)
+        {
+            if (string.IsNullOrWhiteSpace(seedBuffer))
+            {
+                return string.Empty;
+            }
+
+            var startIndex = seedBuffer.IndexOf('{');
+            return startIndex >= 0
+                ? seedBuffer[startIndex..]
+                : string.Empty;
         }
 
         private FinalJsonPayload ParseFinalJsonPayload(string payload)
@@ -594,21 +889,63 @@ namespace SmartWatchProj.Services.Devices
             }
         }
 
-        private static double ParseMatchedDouble(string payload, Regex regex, string fieldName)
+        private static bool HasMatch(string payload, params Regex[] patterns) =>
+            patterns.Any(pattern => pattern.IsMatch(payload));
+
+        private bool TryParseFinalJsonCandidate(string buffer, ref string? lastParseFailureReason, out string candidate)
         {
-            var match = regex.Match(payload);
-            if (!match.Success)
+            var currentFinalBuffer = BuildFinalJsonSeedBuffer(buffer);
+            if (string.IsNullOrWhiteSpace(currentFinalBuffer))
+            {
+                candidate = string.Empty;
+                return false;
+            }
+
+            logStore.Info("COM", $"Final JSON buffer updated: {currentFinalBuffer}");
+            return TryParseFinalJsonFromAccumulatedBuffer(ref currentFinalBuffer, ref lastParseFailureReason, out candidate);
+        }
+
+        private static double ParseMatchedDouble(string payload, IEnumerable<Regex> regexes, string fieldName)
+        {
+            if (!TryParseMatchedDouble(payload, regexes, out var value))
             {
                 throw new InvalidOperationException($"ESP32 payload does not contain {fieldName}. Payload={payload}");
             }
 
-            var text = match.Groups["value"].Value.Replace(',', '.');
-            if (!double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
+            return value;
+        }
+
+        private static bool TryParseMatchedDouble(string payload, IEnumerable<Regex> regexes, out double value)
+        {
+            foreach (var regex in regexes)
             {
-                throw new InvalidOperationException($"ESP32 field {fieldName} is not a valid number: {text}");
+                var match = regex.Match(payload);
+                if (!match.Success)
+                {
+                    continue;
+                }
+
+                var text = match.Groups["value"].Value.Replace(',', '.');
+                if (!double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value))
+                {
+                    throw new InvalidOperationException($"ESP32 field value is not a valid number: {text}");
+                }
+
+                return true;
             }
 
-            return value;
+            value = default;
+            return false;
+        }
+
+        private static double RequireMeasurementValue(double? value, string fieldName)
+        {
+            if (!value.HasValue)
+            {
+                throw new InvalidOperationException($"Final controller JSON not received and ESP32 debug payload does not contain {fieldName}.");
+            }
+
+            return value.Value;
         }
 
         private static Esp32ControllerConfig RequireController(Esp32ControllerConfig? controller) =>
@@ -633,6 +970,8 @@ namespace SmartWatchProj.Services.Devices
 
         private sealed record ControllerResponse(double Temp, double Alco, double Sys, double Dad, string SourceLabel, string ResultSummary);
         private sealed record FinalJsonPayload(double Temp, double Alco, double Sys, double Dad);
+        private sealed record PressureAndFinalJsonReadResult(string PressurePayload, string? FinalJsonPayload);
+        private sealed record OptionalDebugReadResult(string Payload, bool Matched);
 
         private sealed class DevicePortMapConfig
         {
@@ -659,6 +998,11 @@ namespace SmartWatchProj.Services.Devices
             public int TemperatureTimeoutMs { get; init; } = 4000;
             public int AlcoholTimeoutMs { get; init; } = 4000;
             public int PressureTimeoutMs { get; init; } = 25000;
+            public int TemperaturePreparationDelayMs { get; init; } = 2500;
+            public int TemperatureRetryDelayMs { get; init; } = 1500;
+            public int AlcoholPreparationDelayMs { get; init; } = 2500;
+            public int AlcoholRetryDelayMs { get; init; } = 2000;
+            public int PressurePreparationDelayMs { get; init; } = 8000;
             public int FinalJsonTimeoutMs { get; init; } = 5000;
             public int BootBannerDrainTimeoutMs { get; init; } = 1200;
             public int ResetCommandDelayMs { get; init; } = 150;

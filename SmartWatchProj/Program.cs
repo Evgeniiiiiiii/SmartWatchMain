@@ -1,6 +1,7 @@
 ﻿using System;
 using Avalonia;
 using SmartWatchProj.Cli;
+using SmartWatchProj.Services.Devices;
 
 namespace SmartWatchProj
 {
@@ -12,6 +13,11 @@ namespace SmartWatchProj
         [STAThread]
         public static int Main(string[] args)
         {
+            if (LinuxExternalYoloRunner.TryRunCli(args, out var linuxYoloExitCode))
+            {
+                return linuxYoloExitCode;
+            }
+
             if (ComSmokeTestRunner.TryRun(args, out var exitCode))
             {
                 return exitCode;

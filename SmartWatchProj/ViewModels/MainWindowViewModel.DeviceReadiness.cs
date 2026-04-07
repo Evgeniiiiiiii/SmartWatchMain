@@ -504,7 +504,7 @@ namespace SmartWatchProj.ViewModels
                     "Команда x1x1x: запуск измерения температуры",
                     "Команда x1x2x: запуск измерения алкоголя",
                     "Команда x1x3x: запуск измерения давления",
-                    "Парсинг текстовых ответов IRTemperature / Alco / SAD / DAD"
+                    "Парсинг JSON {Temp,Alco,SYS,DAD} с optional debug-логами IRTemperature / Alco / SAD / DAD"
                 }
                 : IsDiagnosticsModeEnabled
                 ? new[]
@@ -520,7 +520,7 @@ namespace SmartWatchProj.ViewModels
                     "Команда x1x1x: измерение температуры",
                     "Команда x1x2x: измерение алкоголя",
                     "Команда x1x3x: измерение давления",
-                    "Парсинг текстовых ответов контроллера"
+                    "Парсинг JSON контроллера с optional debug-логами"
                 };
 
         private int GetMeasurementStepDelayMs() => IsStrictHardwareMode ? 1500 : IsDiagnosticsModeEnabled ? 1200 : 5000;

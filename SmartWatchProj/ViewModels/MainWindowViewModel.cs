@@ -2,13 +2,12 @@
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Media;
 using Avalonia.Media.Imaging;
+using Avalonia.Platform;
 using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Emgu.CV;
 using Emgu.CV.CvEnum;
-using Emgu.CV.Structure;
-using Emgu.CV.Util;
 using LiveChartsCore;
 using LiveChartsCore.SkiaSharpView;
 using LiveChartsCore.SkiaSharpView.Painting;
@@ -128,6 +127,7 @@ namespace SmartWatchProj.ViewModels
         private Yolo? yoloEngine;
         private PdfDocument sessionReport = new PdfDocument();
         private List<VitalMeasurement> sessionMeasurements = new List<VitalMeasurement>();
+        private bool linuxCameraAvailable;
 
 
         public MainWindowViewModel()
@@ -1292,7 +1292,7 @@ namespace SmartWatchProj.ViewModels
         {
             CardId = string.Empty;
             IsEmployeeFound = false;
-            CameraFrame = null;
+            SetCameraFrame(null);
             InstructionMessage = "Готово. Подходите следующий сотрудник.";
             ResultMessage = string.Empty;
             ResultColor = Avalonia.Media.Brushes.Black;
@@ -1333,6 +1333,17 @@ namespace SmartWatchProj.ViewModels
             var devices = GetLinuxVideoDevices();
             var selectedDevice = GetPrimaryLinuxVideoDevice(devices);
 
+            if (OperatingSystem.IsLinux())
+            {
+                InitializeLinuxCapture(selectedDevice, devices);
+                return;
+            }
+
+            InitializeNonLinuxCapture(selectedDevice, devices);
+        }
+
+        private void InitializeNonLinuxCapture(string? selectedDevice, IReadOnlyList<string> devices)
+        {
             try
             {
                 LogInfo("Camera", devices.Count == 0
@@ -1395,6 +1406,28 @@ namespace SmartWatchProj.ViewModels
                 if (capture.Read(probeFrame) && !probeFrame.IsEmpty)
                 {
                     LogInfo("Camera", $"Camera frame received: {probeFrame.Width}x{probeFrame.Height}.");
+
+                    using var decodedBitmap = TryConvertMatToSkBitmap(probeFrame, out var decodeError);
+                    if (decodedBitmap is null)
+                    {
+                        LogWarning("Camera", $"Preview conversion step failed: {decodeError ?? "unknown error"}");
+                        CameraMessage = "Камера подключена, превью недоступно.";
+                        CameraMessageColor = Avalonia.Media.Brushes.DarkOrange;
+                        return;
+                    }
+
+                    var cameraRotation = LoadDeviceRuntimeConfig().CameraRotation;
+                    using var processedBitmap = ApplyCameraRotation(decodedBitmap, cameraRotation);
+                    using var avaloniaBitmap = TryConvertSkBitmapToAvaloniaBitmap(processedBitmap, out var previewError);
+                    if (avaloniaBitmap is null)
+                    {
+                        LogWarning("Camera", $"Preview bitmap step failed: {previewError ?? "unknown error"}");
+                        CameraMessage = "Камера подключена, превью недоступно.";
+                        CameraMessageColor = Avalonia.Media.Brushes.DarkOrange;
+                        return;
+                    }
+
+                    LogInfo("Camera", "Preview conversion ready.");
                 }
                 else
                 {
@@ -1404,6 +1437,47 @@ namespace SmartWatchProj.ViewModels
             catch (Exception ex)
             {
                 LogError("Camera", $"Camera frame probe failed: {ex.Message}");
+            }
+        }
+
+        private void InitializeLinuxCapture(string? selectedDevice, IReadOnlyList<string> devices)
+        {
+            linuxCameraAvailable = false;
+            capture?.Dispose();
+            capture = null;
+
+            LogInfo("Camera", devices.Count == 0
+                ? "Camera devices: none"
+                : $"Camera devices: {string.Join(", ", devices)}");
+            LogInfo("Camera", $"Camera open started: {selectedDevice ?? "/dev/video0"} via Linux fallback path.");
+
+            if (!LinuxCameraFrameGrabber.TryGrabFrame(out var frame, out var devicePath, out var error))
+            {
+                LogError("Camera", $"Camera open failed: {error}");
+                return;
+            }
+
+            using (frame)
+            {
+                linuxCameraAvailable = true;
+                LogInfo("Camera", $"Camera open success: {devicePath ?? selectedDevice ?? "/dev/video0"} via Linux fallback path.");
+                LogInfo("Camera", $"Camera frame received: {frame.Width}x{frame.Height}.");
+                using var previewBitmap = frame.Copy();
+                var avaloniaBitmap = TryConvertSkBitmapToAvaloniaBitmap(previewBitmap, out var previewError);
+                if (avaloniaBitmap is null)
+                {
+                    SetCameraFrame(null);
+                    CameraMessage = "Камера подключена, кадр получен, но preview недоступен.";
+                    CameraMessageColor = Avalonia.Media.Brushes.DarkOrange;
+                    LogWarning("Camera", $"Linux fallback preview conversion failed: {previewError ?? "unknown error"}");
+                    return;
+                }
+
+                SetCameraFrame(avaloniaBitmap);
+                CameraMessage = "Камера подключена, Linux fallback кадр показан.";
+                CameraMessageColor = Avalonia.Media.Brushes.Green;
+                LogInfo("Camera", "Linux fallback preview updated.");
+                LogInfo("Camera", "Linux fallback preview assigned to UI.");
             }
         }
 
@@ -1432,10 +1506,14 @@ namespace SmartWatchProj.ViewModels
 
         private async Task<PresenceCheckResult> VerifyUserWithCamera()
         {
-            LoadYoloModel();
+            if (!OperatingSystem.IsLinux())
+            {
+                LoadYoloModel();
+            }
+
             InitializeCapture();
 
-            if (capture == null || !capture.IsOpened)
+            if (!OperatingSystem.IsLinux() && (capture == null || !capture.IsOpened))
             {
                 const string message = "Камера не инициализирована или недоступна.";
                 Console.WriteLine(message);
@@ -1448,7 +1526,7 @@ namespace SmartWatchProj.ViewModels
                 return PresenceCheckResult.TechnicalFailure(message);
             }
 
-            if (yoloEngine == null)
+            if (!OperatingSystem.IsLinux() && yoloEngine == null)
             {
                 const string message = "YOLO модель не загружена. Проверка невозможна.";
                 Console.WriteLine(message);
@@ -1480,6 +1558,45 @@ namespace SmartWatchProj.ViewModels
             {
                 try
                 {
+                    if (OperatingSystem.IsLinux())
+                    {
+                        using var linuxFrame = ReadLinuxCameraFrame(cameraRotation, out var linuxError);
+                        if (linuxFrame is null)
+                        {
+                            emptyFrameAttempts++;
+                            attempts++;
+
+                            if (emptyFrameAttempts >= maxEmptyFrameAttempts)
+                            {
+                                var noFrameMessage = $"Камера открыта, но не отдаёт кадр. {linuxError}";
+                                Console.WriteLine(noFrameMessage);
+                                LogError("Presence", noFrameMessage);
+                                await Dispatcher.UIThread.InvokeAsync(() =>
+                                {
+                                    ResultMessage = noFrameMessage;
+                                    ResultColor = Avalonia.Media.Brushes.Red;
+                                });
+                                return PresenceCheckResult.TechnicalFailure(noFrameMessage);
+                            }
+
+                            await Task.Delay(120);
+                            continue;
+                        }
+
+                        emptyFrameAttempts = 0;
+                        LogInfo("Camera", $"Camera frame received. Attempt={attempts}, size={linuxFrame.Width}x{linuxFrame.Height}.");
+                        var linuxFrameResult = await ProcessLinuxPresenceFrameAsync(linuxFrame, attempts, processingErrors, maxProcessingErrors, cameraRotation);
+                        processingErrors = linuxFrameResult.ProcessingErrors;
+                        if (linuxFrameResult.Result is not null)
+                        {
+                            return linuxFrameResult.Result;
+                        }
+
+                        attempts++;
+                        await Task.Delay(120);
+                        continue;
+                    }
+
                     using Mat frame = new Mat();
                     if (!capture.Read(frame) || frame.IsEmpty)
                     {
@@ -1526,92 +1643,11 @@ namespace SmartWatchProj.ViewModels
                         continue;
                     }
 
-                    using var processedBitmap = ApplyCameraRotation(decodedBitmap, cameraRotation);
-                    if (processedBitmap is null)
+                    var windowsFrameResult = await ProcessPresenceFrameAsync(decodedBitmap, attempts, processingErrors, maxProcessingErrors, cameraRotation);
+                    processingErrors = windowsFrameResult.ProcessingErrors;
+                    if (windowsFrameResult.Result is not null)
                     {
-                        processingErrors++;
-                        var rotationMessage = DescribeCameraProcessingNull("processedBitmap", processedBitmap);
-                        LogError("Presence", rotationMessage);
-                        if (processingErrors >= maxProcessingErrors)
-                        {
-                            return PresenceCheckResult.TechnicalFailure(rotationMessage);
-                        }
-
-                        await Task.Delay(120);
-                        continue;
-                    }
-
-                    if (cameraRotation == 180)
-                    {
-                        LogInfo("Camera", "Camera rotation applied: 180");
-                    }
-
-                    var results = yoloEngine.RunObjectDetection(processedBitmap, confidence: 0.5, iou: 0.45);
-                    if (results is null)
-                    {
-                        processingErrors++;
-                        var resultsMessage = DescribeCameraProcessingNull("yolo results", results);
-                        LogError("Presence", resultsMessage);
-                        if (processingErrors >= maxProcessingErrors)
-                        {
-                            return PresenceCheckResult.TechnicalFailure(resultsMessage);
-                        }
-
-                        await Task.Delay(120);
-                        continue;
-                    }
-
-                    processingErrors = 0;
-                    LogInfo("YOLO", $"Inference started on frame {frame.Width}x{frame.Height}.");
-
-                    var personResults = results
-                        .Where(r => string.Equals(r.Label?.Name, "person", StringComparison.OrdinalIgnoreCase))
-                        .ToList();
-                    int personCount = personResults.Count(r => r.Confidence > 0.5);
-
-                    processedBitmap.Draw(personResults);
-                    LogInfo("Camera", $"Camera frame received. Attempt={attempts}, persons={personCount}.");
-
-                    var avaloniaBitmap = TryConvertSkBitmapToAvaloniaBitmap(processedBitmap);
-                    if (avaloniaBitmap is null)
-                    {
-                        processingErrors++;
-                        var bitmapMessage = DescribeCameraProcessingNull("preview encode", avaloniaBitmap);
-                        LogError("Presence", bitmapMessage);
-                        if (processingErrors >= maxProcessingErrors)
-                        {
-                            return PresenceCheckResult.TechnicalFailure(bitmapMessage);
-                        }
-
-                        await Task.Delay(120);
-                        continue;
-                    }
-
-                    await Dispatcher.UIThread.InvokeAsync(() =>
-                    {
-                        CameraFrame = avaloniaBitmap;
-
-                        if (personCount == 1)
-                        {
-                            ResultMessage = "Контроль присутствия: в кадре 1 человек — можно продолжать.";
-                            ResultColor = Avalonia.Media.Brushes.Green;
-                        }
-                        else if (personCount == 0)
-                        {
-                            ResultMessage = "Контроль присутствия: человек не обнаружен. Подойдите ближе и смотрите в камеру.";
-                            ResultColor = Avalonia.Media.Brushes.Orange;
-                        }
-                        else
-                        {
-                            ResultMessage = "Два или более человек в кадре. Посторонние выйдите из кадра.";
-                            ResultColor = Avalonia.Media.Brushes.Red;
-                        }
-                    });
-
-                    if (personCount == 1)
-                    {
-                        LogInfo("Presence", "Presence verified by camera and YOLO.");
-                        return PresenceCheckResult.Verified();
+                        return windowsFrameResult.Result;
                     }
 
                     attempts++;
@@ -1694,6 +1730,258 @@ namespace SmartWatchProj.ViewModels
                 capture = null;
                 LogInfo("Camera", "Камера остановлена.");
             }
+
+            linuxCameraAvailable = false;
+        }
+
+        private SKBitmap? ReadLinuxCameraFrame(int cameraRotation, out string? error)
+        {
+            error = null;
+
+            if (!LinuxCameraFrameGrabber.TryGrabFrame(out var frame, out var devicePath, out error))
+            {
+                return null;
+            }
+
+            linuxCameraAvailable = true;
+            LogInfo("Camera", $"Camera open success: {devicePath ?? "/dev/video0"} via Linux fallback path.");
+            if (cameraRotation != 180)
+            {
+                return frame;
+            }
+
+            using (frame)
+            {
+                return ApplyCameraRotation(frame, cameraRotation);
+            }
+        }
+
+        private async Task<PresenceFrameProcessingResult> ProcessPresenceFrameAsync(
+            SKBitmap sourceBitmap,
+            int attempts,
+            int processingErrors,
+            int maxProcessingErrors,
+            int cameraRotation = 0)
+        {
+            using var processedBitmap = cameraRotation == 180 ? ApplyCameraRotation(sourceBitmap, cameraRotation) : sourceBitmap.Copy();
+            if (cameraRotation == 180)
+            {
+                LogInfo("Camera", "Camera rotation applied: 180");
+            }
+
+            LogInfo("YOLO", $"YOLO inference started. Frame={processedBitmap.Width}x{processedBitmap.Height}, attempt={attempts}.");
+            var results = yoloEngine!.RunObjectDetection(processedBitmap, confidence: 0.5, iou: 0.45);
+            if (results is null)
+            {
+                processingErrors++;
+                var resultsMessage = DescribeCameraProcessingNull("yolo results", results);
+                LogError("Presence", resultsMessage);
+                if (processingErrors >= maxProcessingErrors)
+                {
+                    return new PresenceFrameProcessingResult(PresenceCheckResult.TechnicalFailure(resultsMessage), processingErrors);
+                }
+
+                return new PresenceFrameProcessingResult(null, processingErrors);
+            }
+
+            processingErrors = 0;
+
+            var personResults = results
+                .Where(r => string.Equals(r.Label?.Name, "person", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            int personCount = personResults.Count(r => r.Confidence > 0.5);
+            LogInfo("YOLO", $"Person count={personCount}.");
+
+            processedBitmap.Draw(personResults);
+            LogInfo("Camera", $"Camera frame received. Attempt={attempts}, persons={personCount}.");
+
+            if (OperatingSystem.IsLinux())
+            {
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    SetCameraFrame(null);
+                    CameraMessage = "Камера подключена, кадр получен, превью временно отключено на Linux.";
+                    CameraMessageColor = Avalonia.Media.Brushes.DarkOrange;
+                });
+                LogWarning("Camera", "Linux preview path skipped intentionally.");
+                LogWarning("Camera", "Linux preview disabled for stability.");
+            }
+            else
+            {
+            var avaloniaBitmap = TryConvertSkBitmapToAvaloniaBitmap(processedBitmap, out var previewError);
+            if (avaloniaBitmap is null)
+            {
+                var bitmapMessage = string.IsNullOrWhiteSpace(previewError)
+                    ? DescribeCameraProcessingNull("preview bitmap", avaloniaBitmap)
+                    : $"Camera processing failed: preview bitmap step ({previewError}).";
+                LogWarning("Presence", bitmapMessage);
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    CameraMessage = "Камера подключена, превью недоступно.";
+                    CameraMessageColor = Avalonia.Media.Brushes.DarkOrange;
+                });
+            }
+            else
+            {
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    SetCameraFrame(avaloniaBitmap);
+                    CameraMessage = string.Empty;
+                    CameraMessageColor = Avalonia.Media.Brushes.Black;
+                });
+            }
+            }
+
+            await Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                if (personCount == 1)
+                {
+                    ResultMessage = "Контроль присутствия: в кадре 1 человек — можно продолжать.";
+                    ResultColor = Avalonia.Media.Brushes.Green;
+                }
+                else if (personCount == 0)
+                {
+                    ResultMessage = "Контроль присутствия: человек не обнаружен. Подойдите ближе и смотрите в камеру.";
+                    ResultColor = Avalonia.Media.Brushes.Orange;
+                }
+                else
+                {
+                    ResultMessage = "Два или более человек в кадре. Посторонние выйдите из кадра.";
+                    ResultColor = Avalonia.Media.Brushes.Red;
+                }
+            });
+
+            if (personCount == 1)
+            {
+                LogInfo("YOLO", "Single person confirmed.");
+                LogInfo("Presence", "Presence verified by camera and YOLO.");
+                return new PresenceFrameProcessingResult(PresenceCheckResult.Verified(), processingErrors);
+            }
+
+            return new PresenceFrameProcessingResult(null, processingErrors);
+        }
+
+        private async Task<PresenceFrameProcessingResult> ProcessLinuxPresenceFrameAsync(
+            SKBitmap sourceBitmap,
+            int attempts,
+            int processingErrors,
+            int maxProcessingErrors,
+            int cameraRotation = 0)
+        {
+            using var processedBitmap = cameraRotation == 180 ? ApplyCameraRotation(sourceBitmap, cameraRotation) : sourceBitmap.Copy();
+            if (cameraRotation == 180)
+            {
+                LogInfo("Camera", "Camera rotation applied: 180");
+            }
+
+            var modelPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Assets", "yolov8n.onnx");
+            LogInfo("YOLO", $"Linux external inference started. Frame={processedBitmap.Width}x{processedBitmap.Height}, attempt={attempts}.");
+            var inference = await Task.Run(() => LinuxExternalYoloRunner.Run(processedBitmap, modelPath));
+            if (!inference.Success)
+            {
+                processingErrors++;
+                LogWarning("YOLO", $"Linux external inference failed safely: {inference.Error}");
+                if (processingErrors >= maxProcessingErrors)
+                {
+                    return new PresenceFrameProcessingResult(
+                        PresenceCheckResult.TechnicalFailure($"Linux external AI inference failed safely: {inference.Error}"),
+                        processingErrors);
+                }
+
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    CameraMessage = "Камера работает, AI detection временно недоступен.";
+                    CameraMessageColor = Avalonia.Media.Brushes.DarkOrange;
+                });
+                return new PresenceFrameProcessingResult(null, processingErrors);
+            }
+
+            processingErrors = 0;
+            LogInfo("YOLO", $"Linux external inference completed. Person count={inference.PersonCount}, max confidence={inference.MaxConfidence:0.00}.");
+            DrawDetections(processedBitmap, inference.Detections);
+
+            var avaloniaBitmap = TryConvertSkBitmapToAvaloniaBitmap(processedBitmap, out var previewError);
+            if (avaloniaBitmap is null)
+            {
+                LogWarning("Camera", $"Linux preview update failed after AI detection: {previewError ?? "unknown error"}");
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    SetCameraFrame(null);
+                    CameraMessage = "AI detection выполнен, но preview недоступен.";
+                    CameraMessageColor = Avalonia.Media.Brushes.DarkOrange;
+                });
+            }
+            else
+            {
+                var firstDetection = inference.Detections.FirstOrDefault();
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    SetCameraFrame(avaloniaBitmap);
+                    CameraMessage = firstDetection is null
+                        ? "AI detection выполнен: person not detected."
+                        : $"AI detection: person count={inference.PersonCount}, confidence={firstDetection.Confidence:0.00}.";
+                    CameraMessageColor = Avalonia.Media.Brushes.Green;
+                });
+                LogInfo("Camera", "Linux preview updated after AI detection.");
+            }
+
+            await Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                if (inference.PersonCount == 1)
+                {
+                    ResultMessage = "Контроль присутствия: в кадре 1 человек — можно продолжать.";
+                    ResultColor = Avalonia.Media.Brushes.Green;
+                }
+                else if (inference.PersonCount == 0)
+                {
+                    ResultMessage = "Контроль присутствия: человек не обнаружен. Подойдите ближе и смотрите в камеру.";
+                    ResultColor = Avalonia.Media.Brushes.Orange;
+                }
+                else
+                {
+                    ResultMessage = "Два или более человек в кадре. Посторонние выйдите из кадра.";
+                    ResultColor = Avalonia.Media.Brushes.Red;
+                }
+            });
+
+            if (inference.PersonCount == 1)
+            {
+                LogInfo("YOLO", "Single person confirmed.");
+                LogInfo("Presence", "Presence verified by camera and AI.");
+                return new PresenceFrameProcessingResult(PresenceCheckResult.Verified(), processingErrors);
+            }
+
+            return new PresenceFrameProcessingResult(null, processingErrors);
+        }
+
+        private sealed record PresenceFrameProcessingResult(PresenceCheckResult? Result, int ProcessingErrors);
+
+        private void DrawDetections(SKBitmap bitmap, IReadOnlyList<LinuxExternalYoloDetection> detections)
+        {
+            using var canvas = new SKCanvas(bitmap);
+            using var boxPaint = new SKPaint
+            {
+                Color = SKColors.LimeGreen,
+                IsStroke = true,
+                StrokeWidth = 3,
+                IsAntialias = true
+            };
+            using var textPaint = new SKPaint
+            {
+                Color = SKColors.LimeGreen,
+                TextSize = 20,
+                IsAntialias = true
+            };
+
+            foreach (var detection in detections)
+            {
+                if (detection.Width > 0 && detection.Height > 0)
+                {
+                    canvas.DrawRect(detection.X, detection.Y, detection.Width, detection.Height, boxPaint);
+                }
+
+                canvas.DrawText($"{detection.Label} {detection.Confidence:0.00}", detection.X, Math.Max(24, detection.Y - 6), textPaint);
+            }
         }
 
         private static List<string> GetLinuxVideoDevices()
@@ -1755,55 +2043,99 @@ namespace SmartWatchProj.ViewModels
         }
 
         private static SKBitmap? TryConvertMatToSkBitmap(Mat frame)
+            => TryConvertMatToSkBitmap(frame, out _);
+
+        private static SKBitmap? TryConvertMatToSkBitmap(Mat frame, out string? error)
         {
+            error = null;
+
             try
             {
-                using var rgba = new Mat();
-                var conversion = frame.NumberOfChannels switch
+                using var converted = new Mat();
+                if (frame.NumberOfChannels == 4)
                 {
-                    1 => ColorConversion.Gray2Rgba,
-                    3 => ColorConversion.Bgr2Rgba,
-                    4 => ColorConversion.Bgra2Rgba,
-                    _ => ColorConversion.Bgr2Rgba
-                };
+                    frame.CopyTo(converted);
+                }
+                else
+                {
+                    var conversion = frame.NumberOfChannels switch
+                    {
+                        1 => ColorConversion.Gray2Bgra,
+                        3 => ColorConversion.Bgr2Bgra,
+                        _ => ColorConversion.Bgr2Bgra
+                    };
 
-                CvInvoke.CvtColor(frame, rgba, conversion);
+                    CvInvoke.CvtColor(frame, converted, conversion);
+                }
 
-                var info = new SKImageInfo(rgba.Width, rgba.Height, SKColorType.Rgba8888, SKAlphaType.Unpremul);
+                var info = new SKImageInfo(converted.Width, converted.Height, SKColorType.Bgra8888, SKAlphaType.Unpremul);
                 var bitmap = new SKBitmap(info);
-                var byteCount = checked((int)(rgba.Step * rgba.Rows));
+                var byteCount = checked((int)(converted.Step * converted.Rows));
                 var buffer = new byte[byteCount];
-                Marshal.Copy(rgba.DataPointer, buffer, 0, byteCount);
+                Marshal.Copy(converted.DataPointer, buffer, 0, byteCount);
                 Marshal.Copy(buffer, 0, bitmap.GetPixels(), byteCount);
                 return bitmap;
             }
-            catch
+            catch (Exception ex)
             {
+                error = $"{ex.GetType().FullName}: {ex.Message}";
                 return null;
             }
         }
 
         private static Avalonia.Media.Imaging.Bitmap? TryConvertSkBitmapToAvaloniaBitmap(SKBitmap? bitmap)
+            => TryConvertSkBitmapToAvaloniaBitmap(bitmap, out _);
+
+        private void SetCameraFrame(Avalonia.Media.Imaging.Bitmap? nextFrame)
         {
+            var previousFrame = CameraFrame;
+            CameraFrame = nextFrame;
+
+            if (!ReferenceEquals(previousFrame, nextFrame))
+            {
+                previousFrame?.Dispose();
+            }
+        }
+
+        private static Avalonia.Media.Imaging.Bitmap? TryConvertSkBitmapToAvaloniaBitmap(SKBitmap? bitmap, out string? error)
+        {
+            error = null;
+
             if (bitmap is null || bitmap.IsEmpty)
             {
+                error = "bitmap is null or empty";
                 return null;
             }
 
-            using var image = SKImage.FromBitmap(bitmap);
-            if (image is null)
+            try
             {
-                return null;
-            }
+                var writableBitmap = new WriteableBitmap(
+                    new PixelSize(bitmap.Width, bitmap.Height),
+                    new Avalonia.Vector(96, 96),
+                    PixelFormat.Bgra8888,
+                    AlphaFormat.Unpremul);
 
-            using var data = image.Encode(SKEncodedImageFormat.Png, 100);
-            if (data is null || data.Size <= 0)
+                using var locked = writableBitmap.Lock();
+                var rowBytes = bitmap.RowBytes;
+                var height = bitmap.Height;
+                var sourcePointer = bitmap.GetPixels();
+                var rowBuffer = new byte[rowBytes];
+
+                for (var row = 0; row < height; row++)
+                {
+                    var sourceRow = IntPtr.Add(sourcePointer, row * rowBytes);
+                    var destinationRow = IntPtr.Add(locked.Address, row * locked.RowBytes);
+                    Marshal.Copy(sourceRow, rowBuffer, 0, rowBytes);
+                    Marshal.Copy(rowBuffer, 0, destinationRow, rowBytes);
+                }
+
+                return writableBitmap;
+            }
+            catch (Exception ex)
             {
+                error = $"{ex.GetType().FullName}: {ex.Message}";
                 return null;
             }
-
-            using var stream = new MemoryStream(data.ToArray());
-            return new Avalonia.Media.Imaging.Bitmap(stream);
         }
 
         private static SKBitmap ApplyCameraRotation(SKBitmap source, int cameraRotation)

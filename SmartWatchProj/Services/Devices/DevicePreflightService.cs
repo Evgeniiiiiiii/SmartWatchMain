@@ -45,6 +45,8 @@ namespace SmartWatchProj.Services.Devices
                 : ProbeCamera(config.CameraRotation);
             var yoloStatus = noCameraMode
                 ? BuildYoloDisabledStatus()
+                : OperatingSystem.IsLinux()
+                ? ProbeLinuxYoloProcess(cameraProbe)
                 : ProbeYoloModel(cameraProbe, diagnosticsMode);
 
             if (noCameraMode)
@@ -88,12 +90,101 @@ namespace SmartWatchProj.Services.Devices
                 BlockingLabel = "Presence отключен конфигом"
             };
 
+        private DeviceStatusSnapshot ProbeLinuxYoloProcess(CameraProbeResult cameraProbe)
+        {
+            if (cameraProbe.Status.State == DeviceReadinessState.Ready)
+            {
+                var modelPath = Path.Combine(baseDirectory, "Assets", "yolov8n.onnx");
+                if (!File.Exists(modelPath))
+                {
+                    return new DeviceStatusSnapshot
+                    {
+                        Id = "yolo",
+                        DisplayName = "YOLO / presence",
+                        State = DeviceReadinessState.Missing,
+                        StatusLabel = "Model not found",
+                        Detail = $"YOLO model file is missing: {modelPath}.",
+                        IsBlocking = false,
+                        BlockingLabel = "YOLO model is missing"
+                    };
+                }
+
+                try
+                {
+                    logStore.Info("YOLO", "Linux external YOLO preflight started from fallback frame.");
+                    using var bitmap = CreateBitmapFromSample(cameraProbe.SampleFrame!);
+                    var result = LinuxExternalYoloRunner.Run(bitmap, modelPath);
+                    if (!result.Success)
+                    {
+                        logStore.Warning("YOLO", $"Linux external YOLO preflight failed safely: {result.Error}");
+                        return new DeviceStatusSnapshot
+                        {
+                            Id = "yolo",
+                            DisplayName = "YOLO / presence",
+                            State = DeviceReadinessState.Warning,
+                            StatusLabel = "AI unavailable",
+                            Detail = $"Linux camera usable via fallback frame read, but external AI inference failed safely: {result.Error}",
+                            IsBlocking = false,
+                            BlockingLabel = "Linux external AI inference failed safely"
+                        };
+                    }
+
+                    logStore.Info("YOLO", $"Linux external YOLO preflight completed. PersonCount={result.PersonCount}, MaxConfidence={result.MaxConfidence:0.00}.");
+                    return new DeviceStatusSnapshot
+                    {
+                        Id = "yolo",
+                        DisplayName = "YOLO / presence",
+                        State = DeviceReadinessState.Ready,
+                        StatusLabel = result.PersonCount > 0 ? "Person detected" : "AI inference completed",
+                        Detail = $"Linux external AI inference completed safely. PersonCount={result.PersonCount}, MaxConfidence={result.MaxConfidence:0.00}.",
+                        IsBlocking = false
+                    };
+                }
+                catch (Exception ex)
+                {
+                    logStore.Warning("YOLO", $"Linux external YOLO preflight failed safely: {ex.Message}");
+                    return new DeviceStatusSnapshot
+                    {
+                        Id = "yolo",
+                        DisplayName = "YOLO / presence",
+                        State = DeviceReadinessState.Warning,
+                        StatusLabel = "AI unavailable",
+                        Detail = $"Linux camera usable via fallback frame read, but external AI inference failed safely: {ex.Message}",
+                        IsBlocking = false,
+                        BlockingLabel = "Linux external AI inference failed safely"
+                    };
+                }
+            }
+
+            return new DeviceStatusSnapshot
+            {
+                Id = "yolo",
+                DisplayName = "YOLO / presence",
+                State = DeviceReadinessState.Skipped,
+                StatusLabel = "Skipped because camera unavailable",
+                Detail = $"YOLO skipped because camera frame is unavailable. Camera state={cameraProbe.Status.State}.",
+                IsBlocking = false,
+                BlockingLabel = "YOLO skipped because camera is unavailable"
+            };
+        }
+
         private CameraProbeResult ProbeCamera(int cameraRotation)
         {
             var linuxDevices = GetLinuxVideoDevices();
             var selectedDevice = GetPrimaryLinuxVideoDevice(linuxDevices);
             var permissionNote = GetLinuxCameraPermissionNote();
+            logStore.Info("Camera", $"Preflight camera open started. Device={selectedDevice ?? LinuxPrimaryVideoDevice}, backend={(OperatingSystem.IsLinux() ? "V4L2" : "default")}.");
 
+            if (OperatingSystem.IsLinux())
+            {
+                return ProbeLinuxCamera(cameraRotation, linuxDevices, selectedDevice, permissionNote);
+            }
+
+            return ProbeNonLinuxCamera(cameraRotation, linuxDevices, selectedDevice, permissionNote);
+        }
+
+        private CameraProbeResult ProbeNonLinuxCamera(int cameraRotation, IReadOnlyList<string> linuxDevices, string? selectedDevice, string? permissionNote)
+        {
             if (OperatingSystem.IsLinux() && selectedDevice is null)
             {
                 return new CameraProbeResult(new DeviceStatusSnapshot
@@ -116,6 +207,7 @@ namespace SmartWatchProj.Services.Devices
 
                 if (!probe.IsOpened)
                 {
+                    logStore.Warning("Camera", $"Preflight camera open failed. Device={selectedDevice ?? LinuxPrimaryVideoDevice}.");
                     return new CameraProbeResult(new DeviceStatusSnapshot
                     {
                         Id = "camera",
@@ -131,15 +223,19 @@ namespace SmartWatchProj.Services.Devices
                 using var frame = new Mat();
                 for (var attempt = 1; attempt <= 4; attempt++)
                 {
+                    logStore.Info("Camera", $"Preflight frame read attempt {attempt}.");
                     if (!probe.Read(frame) || frame.IsEmpty)
                     {
+                        logStore.Warning("Camera", $"Preflight frame read failed on attempt {attempt}.");
                         Thread.Sleep(150);
                         continue;
                     }
 
+                    logStore.Info("Camera", $"Preflight frame read success on attempt {attempt}: {frame.Width}x{frame.Height}.");
                     using var skBitmap = TryConvertMatToSkBitmap(frame);
                     if (skBitmap is null)
                     {
+                        logStore.Warning("Camera", $"Preflight preview conversion failed on attempt {attempt} after open/frame read.");
                         return new CameraProbeResult(new DeviceStatusSnapshot
                         {
                             Id = "camera",
@@ -153,8 +249,8 @@ namespace SmartWatchProj.Services.Devices
                     }
 
                     using var rotatedBitmap = ApplyCameraRotation(skBitmap, cameraRotation);
-                    using var image = SKImage.FromBitmap(rotatedBitmap);
-                    using var data = image.Encode(SKEncodedImageFormat.Jpeg, 90);
+                    var sampleFrame = CreateCameraSampleFrame(rotatedBitmap);
+                    logStore.Info("Camera", $"Preflight preview conversion success on attempt {attempt}.");
                     return new CameraProbeResult(new DeviceStatusSnapshot
                     {
                         Id = "camera",
@@ -163,7 +259,7 @@ namespace SmartWatchProj.Services.Devices
                         StatusLabel = "Кадр получен",
                         Detail = $"Устройство {(selectedDevice ?? $"index {CameraIndex}")}, backend {(OperatingSystem.IsLinux() ? "V4L2" : "default")}, первый кадр получен ({frame.Width}x{frame.Height}, попытка {attempt}). {BuildCameraEnvironmentDetail(linuxDevices, selectedDevice, permissionNote)}",
                         IsBlocking = false
-                    }, data.ToArray());
+                    }, sampleFrame);
                 }
 
                 return new CameraProbeResult(new DeviceStatusSnapshot
@@ -180,6 +276,7 @@ namespace SmartWatchProj.Services.Devices
             catch (Exception ex)
             {
                 var permissionRelated = IsPermissionError(ex);
+                logStore.Error("Camera", $"Preflight camera exception: {ex.GetType().FullName}: {ex.Message}");
                 return new CameraProbeResult(new DeviceStatusSnapshot
                 {
                     Id = "camera",
@@ -195,9 +292,59 @@ namespace SmartWatchProj.Services.Devices
             }
         }
 
+        private CameraProbeResult ProbeLinuxCamera(int cameraRotation, IReadOnlyList<string> linuxDevices, string? selectedDevice, string? permissionNote)
+        {
+            if (selectedDevice is null)
+            {
+                return new CameraProbeResult(new DeviceStatusSnapshot
+                {
+                    Id = "camera",
+                    DisplayName = "РљР°РјРµСЂР°",
+                    State = DeviceReadinessState.Unavailable,
+                    StatusLabel = "РљР°РјРµСЂР° РЅРµ РЅР°Р№РґРµРЅР°",
+                    Detail = $"РћР¶РёРґР°Р»СЃСЏ РѕСЃРЅРѕРІРЅРѕР№ video device {LinuxPrimaryVideoDevice}. РћР±РЅР°СЂСѓР¶РµРЅРѕ: {(linuxDevices.Count == 0 ? "РЅРµС‚ video-СѓСЃС‚СЂРѕР№СЃС‚РІ" : string.Join(", ", linuxDevices))}.",
+                    IsBlocking = false,
+                    BlockingLabel = "Р‘Р»РѕРєРёСЂСѓРµС‚ СЂРµР°Р»СЊРЅС‹Р№ Р·Р°РїСѓСЃРє: РєР°РјРµСЂР° РѕС‚СЃСѓС‚СЃС‚РІСѓРµС‚"
+                });
+            }
+
+            logStore.Info("Camera", $"Preflight frame read attempt 1 on {selectedDevice} via ffmpeg.");
+            if (!LinuxCameraFrameGrabber.TryGrabFrame(out var frame, out var devicePath, out var error))
+            {
+                logStore.Error("Camera", $"Preflight Linux camera read failed: {error}");
+                return new CameraProbeResult(new DeviceStatusSnapshot
+                {
+                    Id = "camera",
+                    DisplayName = "РљР°РјРµСЂР°",
+                    State = DeviceReadinessState.Error,
+                    StatusLabel = "Camera open failed",
+                    Detail = $"РќРµ СѓРґР°Р»РѕСЃСЊ РѕС‚РєСЂС‹С‚СЊ/СЃС‡РёС‚Р°С‚СЊ РєР°РґСЂ СЃ {(devicePath ?? selectedDevice)} С‡РµСЂРµР· Linux fallback camera path: {error}. {BuildCameraEnvironmentDetail(linuxDevices, selectedDevice, permissionNote)}",
+                    IsBlocking = false,
+                    BlockingLabel = "Р‘Р»РѕРєРёСЂСѓРµС‚ СЂРµР°Р»СЊРЅС‹Р№ Р·Р°РїСѓСЃРє: РєР°РјРµСЂР° РЅРµ РѕС‚РєСЂС‹РІР°РµС‚СЃСЏ"
+                });
+            }
+
+            using (frame)
+            {
+                logStore.Info("Camera", $"Preflight camera open success. Device={devicePath ?? selectedDevice} via Linux fallback path.");
+                logStore.Info("Camera", $"Preflight frame read success on attempt 1: {frame.Width}x{frame.Height}.");
+                logStore.Warning("Camera", "Linux preview path skipped intentionally.");
+                var sampleFrame = CreateCameraSampleFrame(frame);
+                return new CameraProbeResult(new DeviceStatusSnapshot
+                {
+                    Id = "camera",
+                    DisplayName = "РљР°РјРµСЂР°",
+                    State = DeviceReadinessState.Ready,
+                    StatusLabel = "РљР°РґСЂ РїРѕР»СѓС‡РµРЅ",
+                    Detail = $"РЈСЃС‚СЂРѕР№СЃС‚РІРѕ {(devicePath ?? selectedDevice)}, backend Linux fallback, РїРµСЂРІС‹Р№ РєР°РґСЂ РїРѕР»СѓС‡РµРЅ ({frame.Width}x{frame.Height}). {BuildCameraEnvironmentDetail(linuxDevices, selectedDevice, permissionNote)}",
+                    IsBlocking = false
+                }, sampleFrame);
+            }
+        }
+
         private DeviceStatusSnapshot ProbeYoloModel(CameraProbeResult cameraProbe, bool diagnosticsMode)
         {
-            if (cameraProbe.SampleFrameBytes is null)
+            if (cameraProbe.SampleFrame is null)
             {
                 return new DeviceStatusSnapshot
                 {
@@ -205,7 +352,7 @@ namespace SmartWatchProj.Services.Devices
                     DisplayName = "YOLO / presence",
                     State = DeviceReadinessState.Skipped,
                     StatusLabel = "Пропущено из-за камеры",
-                    Detail = $"YOLO skipped because camera state is {cameraProbe.Status.StateText}.",
+                    Detail = $"YOLO skipped because camera frame is unavailable. Camera state={cameraProbe.Status.State}.",
                     IsBlocking = false,
                     BlockingLabel = "Блокирует реальный запуск: YOLO не может стартовать без кадра"
                 };
@@ -228,7 +375,8 @@ namespace SmartWatchProj.Services.Devices
 
             try
             {
-                using var bitmap = SKBitmap.Decode(cameraProbe.SampleFrameBytes);
+                logStore.Info("YOLO", "Linux-safe YOLO preflight started from fallback frame.");
+                using var bitmap = CreateBitmapFromSample(cameraProbe.SampleFrame);
                 using var yolo = new Yolo(new YoloOptions
                 {
                     OnnxModel = modelPath,
@@ -237,6 +385,8 @@ namespace SmartWatchProj.Services.Devices
 
                 var detections = yolo.RunObjectDetection(bitmap, confidence: 0.2, iou: 0.4);
                 var personDetected = detections.Any(item => string.Equals(item.Label.Name, "person", StringComparison.OrdinalIgnoreCase));
+                var personCount = detections.Count(item => string.Equals(item.Label.Name, "person", StringComparison.OrdinalIgnoreCase));
+                logStore.Info("YOLO", $"Linux-safe YOLO preflight completed. PersonCount={personCount}.");
                 var labelSummary = detections.Count == 0
                     ? "объекты не обнаружены"
                     : string.Join(", ", detections.Take(5).Select(item => $"{item.Label.Name}:{item.Confidence:0.00}"));
@@ -773,7 +923,24 @@ namespace SmartWatchProj.Services.Devices
             return rotated;
         }
 
-        private sealed record CameraProbeResult(DeviceStatusSnapshot Status, byte[]? SampleFrameBytes = null);
+        private static CameraSampleFrame CreateCameraSampleFrame(SKBitmap bitmap)
+        {
+            var byteCount = checked(bitmap.RowBytes * bitmap.Height);
+            var pixels = new byte[byteCount];
+            Marshal.Copy(bitmap.GetPixels(), pixels, 0, byteCount);
+            return new CameraSampleFrame(bitmap.Width, bitmap.Height, bitmap.RowBytes, bitmap.ColorType, bitmap.AlphaType, pixels);
+        }
+
+        private static SKBitmap CreateBitmapFromSample(CameraSampleFrame sample)
+        {
+            var info = new SKImageInfo(sample.Width, sample.Height, sample.ColorType, sample.AlphaType);
+            var bitmap = new SKBitmap(info);
+            Marshal.Copy(sample.Pixels, 0, bitmap.GetPixels(), sample.Pixels.Length);
+            return bitmap;
+        }
+
+        private sealed record CameraProbeResult(DeviceStatusSnapshot Status, CameraSampleFrame? SampleFrame = null);
+        private sealed record CameraSampleFrame(int Width, int Height, int RowBytes, SKColorType ColorType, SKAlphaType AlphaType, byte[] Pixels);
 
         private sealed record SerialPortProbeReport(
             IReadOnlyList<string> DetectedPorts,
