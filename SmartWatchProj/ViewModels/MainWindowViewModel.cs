@@ -23,12 +23,15 @@ using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Net;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Diagnostics;
 using YoloDotNet;
 using YoloDotNet.Core;
 using YoloDotNet.Extensions;
@@ -70,11 +73,14 @@ namespace SmartWatchProj.ViewModels
         [ObservableProperty] private ObservableCollection<Employee> employees = new();
         [ObservableProperty] private ObservableCollection<HealthTile> detailedHealthTiles = new(); // Для расчёта, но не биндим напрямую
         [ObservableProperty] private string finalVerdict = "";
+        [ObservableProperty] private string verdictReason = string.Empty;
+        [ObservableProperty] private string verdictRecommendation = string.Empty;
         [ObservableProperty] private Avalonia.Media.IBrush verdictColor = Avalonia.Media.Brushes.Gray;
+        [ObservableProperty] private bool isVerdictVisible;
         // [ObservableProperty] private string humanRecommendation = ""; // Убрали из UI, оставили для PDF
         [ObservableProperty] private bool showDetailedResult = false;
-        [ObservableProperty] private string newEmployeeName;
-        [ObservableProperty] private string newCardId;
+        [ObservableProperty] private string newEmployeeName = string.Empty;
+        [ObservableProperty] private string newCardId = string.Empty;
 
         [ObservableProperty] private string lastHeartRate = "Нет данных";
         [ObservableProperty] private string lastSaturation = "Нет данных";
@@ -88,7 +94,8 @@ namespace SmartWatchProj.ViewModels
 
         [ObservableProperty] private string humanRecommendation = "";
 
-        [ObservableProperty] private string serverUrl = "http://192.168.1.62:3001/api/measurements"; // IP сайта + порт + endpoint
+        [ObservableProperty] private string serverIp = string.Empty;
+        [ObservableProperty] private string appliedServerIp = string.Empty;
         [ObservableProperty] private string syncMessage = ""; // Статус для UI
 
         [ObservableProperty] private string adminPassword = "";  // Пароль админа
@@ -99,6 +106,8 @@ namespace SmartWatchProj.ViewModels
         [ObservableProperty] private string hardwareSafetyStatus = "Готов к работе.";
         [ObservableProperty] private string captchaPrompt = "";  // Текст "Проверка: Нажмите на все цифры X"
         [ObservableProperty] private string currentInstruction = "";  // Текст текущей инструкции
+        [ObservableProperty] private string pressurePrepCountdownText = string.Empty;
+        [ObservableProperty] private bool isPressurePrepActive;
         [ObservableProperty] private double progressValue = 0;  // Значение ProgressBar (0-100)
         [ObservableProperty] private ObservableCollection<int> captchaItems = new();  // Коллекция 9 случайных цифр (0-9)
         [ObservableProperty] private string captchaMessage = "";  // Сообщение об ошибке CAPTCHA
@@ -116,6 +125,7 @@ namespace SmartWatchProj.ViewModels
         private List<int> selectedCaptchaIndices = new List<int>();  // Выбранные индексы
         private List<int> correctCaptchaIndices = new List<int>();  // Индексы с targetDigit
         private TaskCompletionSource<VitalMeasurement>? _measurementCompletion;  // Для ожидания результата измерений
+        private TaskCompletionSource<bool>? pressurePrepCompletion;
         private CancellationTokenSource? measurementRunCts;
         private CancellationTokenSource? preflightCts;
 
@@ -128,26 +138,18 @@ namespace SmartWatchProj.ViewModels
         private PdfDocument sessionReport = new PdfDocument();
         private List<VitalMeasurement> sessionMeasurements = new List<VitalMeasurement>();
         private bool linuxCameraAvailable;
+        private EmployeeOverallStatus employeeOverallStatus = EmployeeOverallStatus.Unknown;
 
 
         public MainWindowViewModel()
         {
+            EnsureCriticalUiStateInitialized();
+
             try
             {
                 LoadEmployeesFromJson();
                 LoadMeasurementsFromJson();
                 UpdateLastData();
-                for (int i = 0; i < 9; i++)
-                {
-                    captchaLefts.Add(0);
-                    captchaTops.Add(0);
-                }
-                for (int i = 0; i < 9; i++)
-                {
-                    captchaBackgrounds.Add(Avalonia.Media.Brushes.White);  // Белый фон по умолчанию
-                }
-                CaptchaItems = new ObservableCollection<int>(Enumerable.Repeat(0, 9));  // Инициализация с 9 плейсхолдерами
-                isCaptchaSelected = new ObservableCollection<bool>(Enumerable.Repeat(false, 9));
                 InitializeReadinessLayer();
                 Console.WriteLine($"Инициализация успешна. Время: {DateTime.Now:dd.MM.yyyy HH:mm:ss}");
             }
@@ -210,6 +212,29 @@ namespace SmartWatchProj.ViewModels
             OnPropertyChanged(nameof(CanEmergencyStop));
         }
 
+        partial void OnServerIpChanged(string value)
+        {
+            var editedValue = value?.Trim() ?? string.Empty;
+            var appliedValue = AppliedServerIp?.Trim() ?? string.Empty;
+            if (!string.Equals(editedValue, appliedValue, StringComparison.Ordinal))
+            {
+                SyncMessage = string.IsNullOrWhiteSpace(editedValue)
+                    ? "Есть неприменённые изменения: IP очищен."
+                    : "Есть неприменённые изменения.";
+                LogInfo("Sync", $"Sync server IP edited but not yet applied: {editedValue}");
+            }
+            else if (TryBuildSyncEndpointUrl(appliedValue, out var endpointUrl, out _))
+            {
+                SyncMessage = $"Применено: {endpointUrl}";
+            }
+            else
+            {
+                SyncMessage = "IP сервера сайта не задан.";
+            }
+
+            OnPropertyChanged(nameof(SyncEndpointUrl));
+        }
+
         // Команда для кнопки Старт
         [RelayCommand]
         private async Task Start()
@@ -223,18 +248,25 @@ namespace SmartWatchProj.ViewModels
 
             try
             {
+                EnsureCriticalUiStateInitialized();
+                EnsureReadinessLayerInitializedForRuntime();
                 LogInfo("Start", "Start requested");
+                LogInfo("Start", "Start entered");
                 CancelMeasurementOperation("start requested new measurement run");
                 measurementRunCts = new CancellationTokenSource();
                 var runCts = measurementRunCts;
                 IsDevicePanelOpen = false;
                 ClearTopInfo();//
                 IsCollectingData = true;
+                ResetVerdictDisplay();
                 HardwareSafetyStatus = "Подготовка к измерению.";
                 ResultMessage = "Проверка пользователя...";
                 ResultColor = Avalonia.Media.Brushes.Black;
                 CameraMessage = string.Empty;
                 CameraMessageColor = Avalonia.Media.Brushes.Black;
+                LogInfo("Start", "Start preconditions checked");
+                LogInfo("History", $"History subsystem ready. Measurements collection count={Measurements.Count}.");
+                LogInfo("Start", $"Verdict visuals ready. VerdictColor={VerdictColor}; FinalVerdict='{FinalVerdict}'.");
                 await CheckEmployeeByCardId();
                 if (!IsEmployeeFound)
                 {
@@ -276,7 +308,10 @@ namespace SmartWatchProj.ViewModels
                 if (!verified)
                 {
                     LogWarning("Start", "Runtime blocked: presence check rejected.");
-                    CameraMessage = "Проверка не пройдена. Повторите.";
+                    if (string.IsNullOrWhiteSpace(CameraMessage))
+                    {
+                        CameraMessage = ResultMessage;
+                    }
                     CameraMessageColor = Avalonia.Media.Brushes.Red;
                     return;
                 }
@@ -292,41 +327,24 @@ namespace SmartWatchProj.ViewModels
 
                 VitalMeasurement measurement;
                 IsOverlayVisible = true;
-                if (IsStrictHardwareMode)
+                LogInfo("Captcha", $"Captcha flow entered. Platform={(OperatingSystem.IsLinux() ? "Linux" : "Windows")}; runtimeStage=pre-measurement; employeeId={currentEmployee.Id}.");
+                IsCaptchaVisible = true;
+                GenerateCaptcha();
+                _measurementCompletion = new TaskCompletionSource<VitalMeasurement>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var completionSource = _measurementCompletion;
+                if (completionSource is null)
                 {
-                    IsCaptchaVisible = false;
-                    LogInfo("Start", "ESP32 runtime stage starting");
-                    measurement = await ExecuteMeasurementScenarioAsync(currentEmployee.Id, runCts.Token);
+                    throw new InvalidOperationException("runtime state is null");
                 }
-                else
-                {
-                    IsCaptchaVisible = true;
-                    GenerateCaptcha();
-                    _measurementCompletion = new TaskCompletionSource<VitalMeasurement>(TaskCreationOptions.RunContinuationsAsynchronously);
-                    var completionSource = _measurementCompletion;
-                    if (completionSource is null)
-                    {
-                        throw new InvalidOperationException("runtime state is null");
-                    }
 
-                    LogInfo("Start", "ESP32 runtime stage waiting for CAPTCHA-confirmed start.");
-                    measurement = await completionSource.Task.WaitAsync(runCts.Token);
-                }
+                LogInfo("Captcha", "Captcha dialog requested.");
+                LogInfo("Captcha", "Captcha dialog shown.");
+                LogInfo("Start", "ESP32 runtime stage waiting for CAPTCHA-confirmed start.");
+                measurement = await completionSource.Task.WaitAsync(runCts.Token);
 
                 if (measurement is null)
                 {
                     throw new InvalidOperationException("measurement DTO is null");
-                }
-
-                if (!TryValidateRealMeasurement(measurement, out var validationMessage))
-                {
-                    ShowDetailedResult = false;
-                    HumanRecommendation = validationMessage;
-                    ResultMessage = validationMessage;
-                    ResultColor = Brushes.DarkOrange;
-                    HardwareSafetyStatus = "Измерение не удалось";
-                    LogWarning("Start", $"Runtime stage failed: {validationMessage}");
-                    return;
                 }
 
                 // Анализ и остальное
@@ -338,18 +356,21 @@ namespace SmartWatchProj.ViewModels
                 }
 
                 DetailedHealthTiles = new ObservableCollection<HealthTile>(healthTiles);
-                VerdictColor = verdictColor;
+                ApplyEmployeeStatusVisuals(measurement);
                 UpdateTilesWithStatuses(healthTiles, verdict);
-                string humanMessage = GenerateHumanRecommendation(measurement, healthTiles);
-                measurement.Diagnosis = humanMessage;
+                string humanMessage = VerdictRecommendation;
+                measurement.Diagnosis = $"{VerdictReason}. {VerdictRecommendation}";
                 measurement.Recommendation = verdict;
                 HumanRecommendation = humanMessage;
-                ShowDetailedResult = true;
-                measurements.Add(measurement);
+                ShowDetailedResult = false;
+                LogInfo("History", $"History record creation started. EmployeeId={measurement.EmployeeId}, Timestamp={measurement.Timestamp:O}.");
+                Measurements.Add(measurement);
                 sessionMeasurements.Add(measurement);
                 SaveMeasurementsToJson();
+                LoadMeasurementsFromJson();
+                LogInfo("History", $"History collection refreshed. History items count after refresh: {Measurements.Count}.");
                 UpdateLastData();
-                ResultMessage = $"Результат: {verdict}";
+                ResultMessage = FinalVerdict;
                 ResultColor = verdictColor;
                 LogInfo("Start", "Start completed");
             }
@@ -373,6 +394,7 @@ namespace SmartWatchProj.ViewModels
                     ? "Аварийная остановка"
                     : "Измерение прервано";
                 LogError("Start", message);
+                LogError("Start", $"Start initialization failed but application remains alive: {ex}");
                 Console.WriteLine($"Исключение в Start(): {ex}");
             }
             finally
@@ -388,8 +410,76 @@ namespace SmartWatchProj.ViewModels
             }
         }
 
+        private void EnsureCriticalUiStateInitialized()
+        {
+            Measurements ??= new ObservableCollection<VitalMeasurement>();
+            Employees ??= new ObservableCollection<Employee>();
+            DetailedHealthTiles ??= new ObservableCollection<HealthTile>();
+            CaptchaItems ??= new ObservableCollection<int>();
+            IsCaptchaSelected ??= new ObservableCollection<bool>();
+            CaptchaBackgrounds ??= new ObservableCollection<IBrush>();
+            CaptchaLefts ??= new ObservableCollection<double>();
+            CaptchaTops ??= new ObservableCollection<double>();
+            selectedCaptchaIndices ??= new List<int>();
+            correctCaptchaIndices ??= new List<int>();
+            sessionMeasurements ??= new List<VitalMeasurement>();
+
+            while (CaptchaItems.Count < 9)
+            {
+                CaptchaItems.Add(0);
+            }
+
+            while (IsCaptchaSelected.Count < 9)
+            {
+                IsCaptchaSelected.Add(false);
+            }
+
+            while (CaptchaBackgrounds.Count < 9)
+            {
+                CaptchaBackgrounds.Add(Avalonia.Media.Brushes.White);
+            }
+
+            while (CaptchaLefts.Count < 9)
+            {
+                CaptchaLefts.Add(0);
+            }
+
+            while (CaptchaTops.Count < 9)
+            {
+                CaptchaTops.Add(0);
+            }
+
+            TopInfoMessage ??= string.Empty;
+            TopInfoColor ??= Brushes.Red;
+            ResultMessage ??= string.Empty;
+            ResultColor ??= Brushes.Black;
+            CameraMessage ??= string.Empty;
+            CameraMessageColor ??= Brushes.Black;
+            CaptchaPrompt ??= string.Empty;
+            CaptchaMessage ??= string.Empty;
+            SyncMessage ??= string.Empty;
+            HardwareSafetyStatus ??= "Готов к работе.";
+            FinalVerdict ??= string.Empty;
+            VerdictReason ??= string.Empty;
+            VerdictRecommendation ??= string.Empty;
+            VerdictColor ??= Brushes.Gray;
+            HumanRecommendation ??= string.Empty;
+        }
+
+        private void ResetVerdictDisplay()
+        {
+            IsVerdictVisible = false;
+            FinalVerdict = string.Empty;
+            VerdictReason = string.Empty;
+            VerdictRecommendation = string.Empty;
+            VerdictColor = Brushes.Transparent;
+        }
+
+        public string SyncEndpointUrl => TryBuildSyncEndpointUrl(AppliedServerIp, out var endpointUrl, out _) ? endpointUrl : string.Empty;
+
         private void GenerateCaptcha()
         {
+            LogInfo("Captcha", $"Captcha challenge created. Platform={(OperatingSystem.IsLinux() ? "Linux" : "Windows")}.");
             var random = new Random();
             int targetDigit = random.Next(0, 10);  // Случайная цель от 0-9
             CaptchaPrompt = $"Проверка: Нажмите на все цифры {targetDigit}";
@@ -459,6 +549,7 @@ namespace SmartWatchProj.ViewModels
             selectedCaptchaIndices.Clear();
             CaptchaMessage = "";
             SelectedCount = 0;
+            LogInfo("Captcha", $"Captcha dialog shown. Prompt='{CaptchaPrompt}'.");
         }
 
 
@@ -492,6 +583,7 @@ namespace SmartWatchProj.ViewModels
             {
                 CaptchaMessage = "Верно!";
                 IsCaptchaVisible = false;  // Скрываем CAPTCHA
+                LogInfo("Captcha", "Captcha completed.");
 
                 // Запускаем процесс измерений
                 _ = StartMeasurementProcessAsync();  // Async, результат через TCS
@@ -499,6 +591,7 @@ namespace SmartWatchProj.ViewModels
             else
             {
                 CaptchaMessage = "Ошибка, попробуйте снова";
+                LogWarning("Captcha", "Captcha cancelled or failed validation. Regenerating current challenge state.");
                 selectedCaptchaIndices.Clear();
                 SelectedCount = 0;
 
@@ -520,15 +613,18 @@ namespace SmartWatchProj.ViewModels
                 }
 
                 var cancellationToken = measurementRunCts?.Token ?? CancellationToken.None;
+                LogInfo("Start", "ESP32 runtime stage starting after CAPTCHA.");
                 var measurement = await ExecuteMeasurementScenarioAsync(currentEmployeeId, cancellationToken);
                 _measurementCompletion?.TrySetResult(measurement);
             }
             catch (OperationCanceledException ex)
             {
+                LogWarning("Captcha", "Captcha flow cancelled before measurement completion.");
                 _measurementCompletion?.TrySetException(ex);
             }
             catch (Exception ex)
             {
+                LogError("Captcha", $"Captcha-confirmed measurement start failed: {ex.Message}");
                 _measurementCompletion?.TrySetException(ex);
             }
         }
@@ -586,7 +682,7 @@ namespace SmartWatchProj.ViewModels
                 case MeasurementWorkflowStage.PreparePressure:
                     LogInfo("Start", "PreparePressure started");
                     LogInfo("Start", "Подготовка к давлению");
-                    await RunPreparationStageAsync("Наденьте манжету и не двигайтесь", seconds: 4, progressStart: 52, progressEnd: 72, cancellationToken);
+                    await RunPressurePreparationStageAsync(cancellationToken);
                     LogInfo("Start", "PreparePressure completed");
                     return;
                 case MeasurementWorkflowStage.MeasurePressure:
@@ -630,41 +726,59 @@ namespace SmartWatchProj.ViewModels
             ProgressValue = progressEnd;
         }
 
-        private bool TryValidateRealMeasurement(VitalMeasurement measurement, out string message)
+        private async Task RunPressurePreparationStageAsync(CancellationToken cancellationToken)
         {
-            var issues = new List<string>();
+            const int totalSeconds = 30;
+            const double progressStart = 52;
+            const double progressEnd = 72;
 
-            if (measurement.Temperature < 34.0 || measurement.Temperature > 42.5)
+            LogInfo("Start", "Pressure prep screen shown");
+            CurrentInstruction = "Измерение давления. Пожалуйста, наденьте манжету и плотно закрепите на предплечье, при готовности нажмите старт";
+            IsPressurePrepActive = true;
+            pressurePrepCompletion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            try
             {
-                issues.Add($"температура {measurement.Temperature:F2} выглядит как комнатная/нечеловеческая");
+                for (var remaining = totalSeconds; remaining >= 1; remaining--)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    PressurePrepCountdownText = $"В случае если кнопка не будет нажата, измерение начнется автоматически через: {remaining}";
+                    LogInfo("Start", $"Pressure prep auto-start countdown: {remaining}");
+                    ProgressValue = progressStart + ((totalSeconds - remaining) / (double)totalSeconds) * (progressEnd - progressStart);
+
+                    var delayTask = Task.Delay(1000, cancellationToken);
+                    var completedTask = await Task.WhenAny(pressurePrepCompletion.Task, delayTask);
+                    if (completedTask == pressurePrepCompletion.Task)
+                    {
+                        await pressurePrepCompletion.Task;
+                        ProgressValue = progressEnd;
+                        PressurePrepCountdownText = string.Empty;
+                        return;
+                    }
+                }
+
+                LogInfo("Start", "Pressure prep auto-start triggered");
+                pressurePrepCompletion.TrySetResult(true);
+                ProgressValue = progressEnd;
+                PressurePrepCountdownText = string.Empty;
+            }
+            finally
+            {
+                IsPressurePrepActive = false;
+                pressurePrepCompletion = null;
+            }
+        }
+
+        [RelayCommand]
+        private void StartPressurePrep()
+        {
+            if (!IsPressurePrepActive || pressurePrepCompletion is null)
+            {
+                return;
             }
 
-            if (measurement.AlcoholLevel < 0 || measurement.AlcoholLevel > 5.0)
-            {
-                issues.Add($"алкоголь {measurement.AlcoholLevel:F2} выглядит как сырое/debug значение");
-            }
-
-            if (measurement.BloodPressureSystolic == 255 || measurement.BloodPressureDiastolic == 255)
-            {
-                issues.Add($"давление {measurement.BloodPressureSystolic:F0}/{measurement.BloodPressureDiastolic:F0} является debug-значением 255/255");
-            }
-            else if (measurement.BloodPressureSystolic < 70
-                || measurement.BloodPressureSystolic > 240
-                || measurement.BloodPressureDiastolic < 40
-                || measurement.BloodPressureDiastolic > 140
-                || measurement.BloodPressureDiastolic >= measurement.BloodPressureSystolic)
-            {
-                issues.Add($"давление {measurement.BloodPressureSystolic:F0}/{measurement.BloodPressureDiastolic:F0} не похоже на валидное измерение");
-            }
-
-            if (issues.Count == 0)
-            {
-                message = string.Empty;
-                return true;
-            }
-
-            message = $"Измерение не удалось: {string.Join("; ", issues)}. Повторите цикл с корректной подготовкой. Сырые значения: temp={measurement.Temperature:F2}, alco={measurement.AlcoholLevel:F2}, pressure={measurement.BloodPressureSystolic:F0}/{measurement.BloodPressureDiastolic:F0}.";
-            return false;
+            LogInfo("Start", "Pressure prep manual start clicked");
+            pressurePrepCompletion.TrySetResult(true);
         }
 
         [RelayCommand]
@@ -725,35 +839,105 @@ namespace SmartWatchProj.ViewModels
 
 
         [RelayCommand]
+        private void ApplyServerIp()
+        {
+            var requestedIp = ServerIp?.Trim() ?? string.Empty;
+            LogInfo("Sync", $"Sync server IP apply requested: {requestedIp}");
+
+            if (!TryBuildSyncEndpointUrl(requestedIp, out var endpointUrl, out var validationError))
+            {
+                SyncMessage = $"Некорректный IP: {validationError}";
+                ResultMessage = SyncMessage;
+                ResultColor = Brushes.Red;
+                LogWarning("Sync", $"Sync server IP validation failed: {validationError}");
+                return;
+            }
+
+            AppliedServerIp = requestedIp;
+            SaveDeviceRuntimeConfig(config => config.ServerIp = requestedIp);
+            SyncMessage = $"Применено: {endpointUrl}";
+            LogInfo("Sync", $"Sync server IP applied successfully: {requestedIp}");
+            LogInfo("Sync", $"Sync endpoint URL updated to: {endpointUrl}");
+            OnPropertyChanged(nameof(SyncEndpointUrl));
+        }
+
+        [RelayCommand]
         private async Task SyncData()
         {
+            if (!TryBuildSyncEndpointUrl(AppliedServerIp, out var requestUrl, out var validationError))
+            {
+                var message = $"Синхронизация недоступна: {validationError}";
+                SyncMessage = message;
+                ResultMessage = message;
+                ResultColor = Brushes.Red;
+                LogWarning("Sync", $"Sync aborted: applied server IP invalid. Value='{AppliedServerIp}'. Reason={validationError}");
+                return;
+            }
+
+            var payload = Measurements.ToList();
+            var payloadPreview = string.Join("; ", payload.Take(2).Select(item =>
+                $"EmployeeId={item.EmployeeId}, Timestamp={item.Timestamp:O}, Temp={item.Temperature:F2}, Alco={item.AlcoholLevel:F2}, SYS={item.BloodPressureSystolic:F0}, DAD={item.BloodPressureDiastolic:F0}, Recommendation={item.Recommendation ?? "n/a"}"));
+            const int syncTimeoutSeconds = 10;
+            var stopwatch = Stopwatch.StartNew();
+
             try
             {
-                string serverUrl = "http://192.168.1.62:3001/api/measurements";  // URL сервера
+                SyncMessage = $"Синхронизация: отправка на {requestUrl}";
+                LogInfo("Sync", $"Sync request using applied server IP: {AppliedServerIp}");
+                LogInfo("Sync", $"Final request URL: {requestUrl}");
+                LogInfo("Sync", "HTTP method: POST");
+                LogInfo("Sync", $"HTTP timeout: {syncTimeoutSeconds}s");
+                LogInfo("Sync", $"Payload count: {payload.Count}");
+                LogInfo("Sync", $"Payload preview: {(string.IsNullOrWhiteSpace(payloadPreview) ? "empty" : payloadPreview)}");
 
-                // Сериализуем текущие measurements из коллекции (не из файла, чтобы актуально)
-                string jsonData = JsonSerializer.Serialize(Measurements.ToList(), new JsonSerializerOptions { WriteIndented = true });
+                string jsonData = JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true });
 
-                using var client = new HttpClient();
+                using var client = new HttpClient
+                {
+                    Timeout = TimeSpan.FromSeconds(syncTimeoutSeconds)
+                };
                 var content = new StringContent(jsonData, Encoding.UTF8, "application/json");
-                var response = await client.PostAsync(serverUrl, content);
+                var response = await client.PostAsync(requestUrl, content);
+                var responseBody = await response.Content.ReadAsStringAsync();
+                stopwatch.Stop();
+
+                var responsePreview = responseBody.Length > 400
+                    ? responseBody[..400]
+                    : responseBody;
+                LogInfo("Sync", $"HTTP status code: {(int)response.StatusCode} {response.StatusCode}");
+                LogInfo("Sync", $"Response body preview: {responsePreview}");
+                LogInfo("Sync", $"Elapsed time: {stopwatch.ElapsedMilliseconds} ms");
 
                 if (response.IsSuccessStatusCode)
                 {
                     ResultMessage = "Данные синхронизированы успешно!";
                     ResultColor = Brushes.Green;
+                    SyncMessage = $"Синхронизация успешна: {(int)response.StatusCode} {response.StatusCode}";
                 }
                 else
                 {
-                    string error = await response.Content.ReadAsStringAsync();
-                    ResultMessage = $"Ошибка синхронизации: {response.StatusCode} - {error}";
+                    ResultMessage = $"Ошибка синхронизации: {(int)response.StatusCode} {response.StatusCode}. Проверьте IP сервера сайта и доступность API.";
                     ResultColor = Brushes.Red;
+                    SyncMessage = $"Сервер вернул ошибку: {(int)response.StatusCode} {response.StatusCode}";
                 }
             }
             catch (Exception ex)
             {
-                ResultMessage = $"Исключение при синхронизации: {ex.Message}";
+                stopwatch.Stop();
+                var innerMessage = ex.InnerException?.Message ?? "none";
+                LogError("Sync", $"Sync exception. Type={ex.GetType().FullName}; Message={ex.Message}; Inner={innerMessage}; FinalRequestUrl={requestUrl}; ServerIp={AppliedServerIp}");
+
+                var friendlyMessage = ex switch
+                {
+                    TaskCanceledException => "Синхронизация не завершилась вовремя. Проверьте IP сервера сайта и сеть.",
+                    HttpRequestException httpEx when httpEx.InnerException is not null => $"Не удалось подключиться к серверу сайта: {httpEx.InnerException.Message}",
+                    HttpRequestException => "Не удалось выполнить HTTP-запрос к серверу сайта.",
+                    _ => $"Исключение при синхронизации: {ex.Message}"
+                };
+
+                ResultMessage = friendlyMessage;
                 ResultColor = Brushes.Red;
+                SyncMessage = friendlyMessage;
             }
         }
 
@@ -764,40 +948,85 @@ namespace SmartWatchProj.ViewModels
         [RelayCommand]
         private void AddEmployee()  
         {
-            if (string.IsNullOrWhiteSpace(NewEmployeeName) || string.IsNullOrWhiteSpace(NewCardId))
+            LogInfo("Employees", $"Add employee clicked. Name='{NewEmployeeName ?? string.Empty}', CardId='{NewCardId ?? string.Empty}'.");
+
+            var normalizedName = (NewEmployeeName ?? string.Empty).Trim();
+            var normalizedCardId = (NewCardId ?? string.Empty).Trim();
+
+            if (string.IsNullOrWhiteSpace(normalizedName))
             {
-                ShowTopInfo("Введите ФИО и CardId!", Brushes.Red);
+                LogWarning("Employees", "Add employee validation result: rejected. reason=name-empty");
+                ShowTopInfo("Введите ФИО!", Brushes.Red);
+                LogWarning("Employees", "Add employee rejected: reason=name-empty");
                 return;
             }
 
-            if (Employees.Any(e => e.CardId == NewCardId))
+            if (string.IsNullOrWhiteSpace(normalizedCardId))
             {
+                LogWarning("Employees", "Add employee validation result: rejected. reason=cardid-empty");
+                ShowTopInfo("Введите CardId!", Brushes.Red);
+                LogWarning("Employees", "Add employee rejected: reason=cardid-empty");
+                return;
+            }
+
+            if (Employees.Any(e => string.Equals(e.CardId?.Trim(), normalizedCardId, StringComparison.OrdinalIgnoreCase)))
+            {
+                LogWarning("Employees", $"Add employee validation result: rejected. reason=duplicate-cardid:{normalizedCardId}");
                 ShowTopInfo("CardId уже существует!", Brushes.Red);
+                LogWarning("Employees", $"Add employee rejected: reason=duplicate-cardid:{normalizedCardId}");
                 return;
             }
 
-            // Опционально: проверка на дубликат ФИО
-            if (Employees.Any(e => e.Name == NewEmployeeName))
+            if (Employees.Any(e => string.Equals(e.Name?.Trim(), normalizedName, StringComparison.OrdinalIgnoreCase)))
             {
+                LogWarning("Employees", $"Add employee validation result: rejected. reason=duplicate-name:{normalizedName}");
                 ShowTopInfo("Сотрудник с таким ФИО уже есть!", Brushes.Red);
+                LogWarning("Employees", $"Add employee rejected: reason=duplicate-name:{normalizedName}");
                 return;
             }
 
-            int newId = Employees.Any() ? Employees.Max(e => e.Id) + 1 : 1;  // Авто-ID
-            var newEmployee = new Employee { Id = newId, Name = NewEmployeeName, CardId = NewCardId, FaceData = null };
-            Employees.Add(newEmployee);
-            SaveEmployeesToJson();
-            CardId = newEmployee.CardId;
-            currentEmployeeId = newEmployee.Id;
-            IsEmployeeFound = true;
-            UpdateEmployeeStatus(newEmployee);
-            OnPropertyChanged(nameof(CanStartWorkflow));
-            OnPropertyChanged(nameof(StartAvailabilityReason));
-            ShowTopInfo("Сотрудник добавлен и подтверждён", Brushes.Green);
+            LogInfo("Employees", "Add employee validation result: accepted");
 
-            // Очистить поля после добавления
-            NewEmployeeName = string.Empty;
-            NewCardId = string.Empty;
+            var newId = Employees.Any() ? Employees.Max(e => e.Id) + 1 : 1;
+            var newEmployee = new Employee { Id = newId, Name = normalizedName, CardId = normalizedCardId, FaceData = null };
+
+            try
+            {
+                LogInfo("Employees", $"Add employee save started. Id={newEmployee.Id}, CardId={newEmployee.CardId}.");
+                Employees.Add(newEmployee);
+
+                if (!SaveEmployeesToJson())
+                {
+                    Employees.Remove(newEmployee);
+                    ShowTopInfo("Не удалось сохранить сотрудника.", Brushes.Red);
+                    LogError("Employees", $"Add employee rejected: reason=save-failed. CardId={newEmployee.CardId}.");
+                    return;
+                }
+
+                LogInfo("Employees", $"Add employee save completed. Id={newEmployee.Id}, CardId={newEmployee.CardId}.");
+                LogInfo("Employees", $"Employees collection count after add: {Employees.Count}");
+
+                CardId = newEmployee.CardId;
+                currentEmployeeId = newEmployee.Id;
+                IsEmployeeFound = true;
+                UpdateEmployeeStatus(newEmployee);
+                OnPropertyChanged(nameof(CanStartWorkflow));
+                OnPropertyChanged(nameof(StartAvailabilityReason));
+                ShowTopInfo("Сотрудник добавлен и подтверждён", Brushes.Green);
+
+                NewEmployeeName = string.Empty;
+                NewCardId = string.Empty;
+            }
+            catch (Exception ex)
+            {
+                if (Employees.Contains(newEmployee))
+                {
+                    Employees.Remove(newEmployee);
+                }
+
+                LogError("Employees", $"Add employee rejected: reason=exception. Type={ex.GetType().FullName}; Message={ex.Message}");
+                ShowTopInfo("Не удалось добавить сотрудника.", Brushes.Red);
+            }
         }
 
 
@@ -1137,6 +1366,7 @@ namespace SmartWatchProj.ViewModels
             try
             {
                 var jsonPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, MeasurementsJsonPath);
+                LogInfo("History", $"Platform-specific history path resolved to: {jsonPath}");
 
                 // Чтобы сохранить все существующие измерения, сначала загружаем текущий JSON (если есть)
                 List<VitalMeasurement> allMeasurements = new List<VitalMeasurement>();
@@ -1169,10 +1399,12 @@ namespace SmartWatchProj.ViewModels
 
                 var json = JsonSerializer.Serialize(allMeasurements, new JsonSerializerOptions { WriteIndented = true });
                 File.WriteAllText(jsonPath, json);
+                LogInfo("History", $"History record saved. Count={allMeasurements.Count}.");
                 Console.WriteLine($"Saved {allMeasurements.Count} measurements to {jsonPath}.");
             }
             catch (Exception ex)
             {
+                LogError("History", $"History save failed: {ex.Message}");
                 Console.WriteLine($"Error saving measurements: {ex.Message}");
             }
         }
@@ -1182,6 +1414,7 @@ namespace SmartWatchProj.ViewModels
             try
             {
                 var jsonPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, MeasurementsJsonPath);
+                LogInfo("History", $"History load path: {jsonPath}");
                 if (File.Exists(jsonPath))
                 {
                     var json = File.ReadAllText(jsonPath);
@@ -1199,37 +1432,44 @@ namespace SmartWatchProj.ViewModels
                             .ToList();
 
                         Measurements = new ObservableCollection<VitalMeasurement>(allSorted);
+                        LogInfo("History", $"History load result count: {Measurements.Count}.");
                         Console.WriteLine($"Loaded {Measurements.Count} measurements (all employees).");
                     }
                     else
                     {
+                        LogWarning("History", "History load result count: 0 (deserialized collection is null).");
                         Console.WriteLine("No measurements loaded from JSON.");
                     }
                 }
                 else
                 {
+                    LogWarning("History", "History storage file not found during load.");
                     Console.WriteLine($"Measurements JSON file not found at {jsonPath}.");
                 }
             }
             catch (Exception ex)
             {
+                LogError("History", $"History load failed: {ex.Message}");
                 Console.WriteLine($"Error loading measurements: {ex.Message}");
             }
         }
 
-        private void SaveEmployeesToJson()
+        private bool SaveEmployeesToJson()
         {
             var fullPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, EmployeesJsonPath);
             try
             {
                 var options = new JsonSerializerOptions { WriteIndented = true };
-                var json = JsonSerializer.Serialize(employees.ToList(), options);
+                var json = JsonSerializer.Serialize(Employees.ToList(), options);
                 File.WriteAllText(fullPath, json);
                 Console.WriteLine($"Сотрудники сохранены в {EmployeesJsonPath}");
+                return true;
             }
             catch (Exception ex)
             {
+                LogError("Employees", $"Employees JSON save failed: {ex.Message}");
                 Console.WriteLine($"Ошибка записи JSON сотрудников: {ex.Message}");
+                return false;
             }
         }
 
@@ -1461,8 +1701,8 @@ namespace SmartWatchProj.ViewModels
             {
                 linuxCameraAvailable = true;
                 LogInfo("Camera", $"Camera open success: {devicePath ?? selectedDevice ?? "/dev/video0"} via Linux fallback path.");
-                LogInfo("Camera", $"Camera frame received: {frame.Width}x{frame.Height}.");
-                using var previewBitmap = frame.Copy();
+                LogInfo("Camera", $"Linux raw frame received: {frame.Width}x{frame.Height}.");
+                using var previewBitmap = CreatePreviewBitmapForUi(frame, LoadDeviceRuntimeConfig().CameraRotation);
                 var avaloniaBitmap = TryConvertSkBitmapToAvaloniaBitmap(previewBitmap, out var previewError);
                 if (avaloniaBitmap is null)
                 {
@@ -1476,8 +1716,7 @@ namespace SmartWatchProj.ViewModels
                 SetCameraFrame(avaloniaBitmap);
                 CameraMessage = "Камера подключена, Linux fallback кадр показан.";
                 CameraMessageColor = Avalonia.Media.Brushes.Green;
-                LogInfo("Camera", "Linux fallback preview updated.");
-                LogInfo("Camera", "Linux fallback preview assigned to UI.");
+                LogInfo("Camera", "Linux CameraFrame assigned from rotated bitmap.");
             }
         }
 
@@ -1680,12 +1919,14 @@ namespace SmartWatchProj.ViewModels
                 }
             }
 
-            const string timeoutMessage = "Проверка завершена: за 20 секунд не удалось подтвердить присутствие одного человека.";
+            const string timeoutMessage = "В кадре не зафиксирован сотрудник, измерение отменено";
             LogWarning("Presence", timeoutMessage);
             await Dispatcher.UIThread.InvokeAsync(() =>
             {
                 ResultMessage = timeoutMessage;
                 ResultColor = Avalonia.Media.Brushes.Red;
+                CameraMessage = timeoutMessage;
+                CameraMessageColor = Avalonia.Media.Brushes.Red;
             });
 
             return PresenceCheckResult.Rejected(timeoutMessage);
@@ -1745,14 +1986,11 @@ namespace SmartWatchProj.ViewModels
 
             linuxCameraAvailable = true;
             LogInfo("Camera", $"Camera open success: {devicePath ?? "/dev/video0"} via Linux fallback path.");
-            if (cameraRotation != 180)
-            {
-                return frame;
-            }
-
+            LogInfo("Camera", $"Linux raw frame received: {frame.Width}x{frame.Height}.");
             using (frame)
             {
-                return ApplyCameraRotation(frame, cameraRotation);
+                LogInfo("Camera", "Linux raw-frame UI path bypassed/removed.");
+                return frame.Copy();
             }
         }
 
@@ -1766,7 +2004,7 @@ namespace SmartWatchProj.ViewModels
             using var processedBitmap = cameraRotation == 180 ? ApplyCameraRotation(sourceBitmap, cameraRotation) : sourceBitmap.Copy();
             if (cameraRotation == 180)
             {
-                LogInfo("Camera", "Camera rotation applied: 180");
+                LogInfo("Camera", "Linux rotation configured/applied: 180");
             }
 
             LogInfo("YOLO", $"YOLO inference started. Frame={processedBitmap.Width}x{processedBitmap.Height}, attempt={attempts}.");
@@ -1838,16 +2076,22 @@ namespace SmartWatchProj.ViewModels
                 {
                     ResultMessage = "Контроль присутствия: в кадре 1 человек — можно продолжать.";
                     ResultColor = Avalonia.Media.Brushes.Green;
+                    CameraMessage = string.Empty;
+                    CameraMessageColor = Avalonia.Media.Brushes.Black;
                 }
                 else if (personCount == 0)
                 {
-                    ResultMessage = "Контроль присутствия: человек не обнаружен. Подойдите ближе и смотрите в камеру.";
-                    ResultColor = Avalonia.Media.Brushes.Orange;
+                    ResultMessage = "В кадре не зафиксирован сотрудник, измерение отменено";
+                    ResultColor = Avalonia.Media.Brushes.Red;
+                    CameraMessage = ResultMessage;
+                    CameraMessageColor = Avalonia.Media.Brushes.Red;
                 }
                 else
                 {
-                    ResultMessage = "Два или более человек в кадре. Посторонние выйдите из кадра.";
+                    ResultMessage = "В кадре двое или более лиц, посторонним пожалуйста выйти из помещения";
                     ResultColor = Avalonia.Media.Brushes.Red;
+                    CameraMessage = ResultMessage;
+                    CameraMessageColor = Avalonia.Media.Brushes.Red;
                 }
             });
 
@@ -1871,7 +2115,8 @@ namespace SmartWatchProj.ViewModels
             using var processedBitmap = cameraRotation == 180 ? ApplyCameraRotation(sourceBitmap, cameraRotation) : sourceBitmap.Copy();
             if (cameraRotation == 180)
             {
-                LogInfo("Camera", "Camera rotation applied: 180");
+                LogInfo("Camera", "Linux rotation forced: 180");
+                LogInfo("Camera", $"Linux rotated bitmap created: {processedBitmap.Width}x{processedBitmap.Height}.");
             }
 
             var modelPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Assets", "yolov8n.onnx");
@@ -1922,7 +2167,7 @@ namespace SmartWatchProj.ViewModels
                         : $"AI detection: person count={inference.PersonCount}, confidence={firstDetection.Confidence:0.00}.";
                     CameraMessageColor = Avalonia.Media.Brushes.Green;
                 });
-                LogInfo("Camera", "Linux preview updated after AI detection.");
+                LogInfo("Camera", "Linux CameraFrame assigned from rotated bitmap.");
             }
 
             await Dispatcher.UIThread.InvokeAsync(() =>
@@ -1931,16 +2176,22 @@ namespace SmartWatchProj.ViewModels
                 {
                     ResultMessage = "Контроль присутствия: в кадре 1 человек — можно продолжать.";
                     ResultColor = Avalonia.Media.Brushes.Green;
+                    CameraMessage = string.Empty;
+                    CameraMessageColor = Avalonia.Media.Brushes.Black;
                 }
                 else if (inference.PersonCount == 0)
                 {
-                    ResultMessage = "Контроль присутствия: человек не обнаружен. Подойдите ближе и смотрите в камеру.";
-                    ResultColor = Avalonia.Media.Brushes.Orange;
+                    ResultMessage = "В кадре не зафиксирован сотрудник, измерение отменено";
+                    ResultColor = Avalonia.Media.Brushes.Red;
+                    CameraMessage = ResultMessage;
+                    CameraMessageColor = Avalonia.Media.Brushes.Red;
                 }
                 else
                 {
-                    ResultMessage = "Два или более человек в кадре. Посторонние выйдите из кадра.";
+                    ResultMessage = "В кадре двое или более лиц, посторонним пожалуйста выйти из помещения";
                     ResultColor = Avalonia.Media.Brushes.Red;
+                    CameraMessage = ResultMessage;
+                    CameraMessageColor = Avalonia.Media.Brushes.Red;
                 }
             });
 
@@ -2086,6 +2337,14 @@ namespace SmartWatchProj.ViewModels
         private static Avalonia.Media.Imaging.Bitmap? TryConvertSkBitmapToAvaloniaBitmap(SKBitmap? bitmap)
             => TryConvertSkBitmapToAvaloniaBitmap(bitmap, out _);
 
+        private SKBitmap CreatePreviewBitmapForUi(SKBitmap sourceBitmap, int cameraRotation)
+        {
+            LogInfo("Camera", $"Linux rotation forced: {cameraRotation}");
+            var previewBitmap = ApplyCameraRotation(sourceBitmap, cameraRotation);
+            LogInfo("Camera", $"Linux rotated bitmap created: {previewBitmap.Width}x{previewBitmap.Height}.");
+            return previewBitmap;
+        }
+
         private void SetCameraFrame(Avalonia.Media.Imaging.Bitmap? nextFrame)
         {
             var previousFrame = CameraFrame;
@@ -2154,6 +2413,283 @@ namespace SmartWatchProj.ViewModels
             return rotated;
         }
 
+        private void ApplyEmployeeStatusVisuals(VitalMeasurement? measurement)
+        {
+            var alcoholStatus = EvaluateAlcoholStatus(measurement);
+            var pressureStatus = EvaluatePressureStatus(measurement);
+            var temperatureStatus = EvaluateTemperatureStatus(measurement);
+            var verdictPresentation = BuildVerdictPresentation(measurement, alcoholStatus, pressureStatus, temperatureStatus);
+
+            LogInfo("Assessment", $"Alcohol assessment source: {(measurement is null ? "missing" : measurement.AlcoholAssessmentSource)}");
+            LogInfo("Assessment", $"Alcohol raw value resolved to: {(measurement is null ? "null" : measurement.AlcoholLevel.ToString("F2", System.Globalization.CultureInfo.InvariantCulture))}");
+            if (measurement is not null && !measurement.HasAlcoholValue)
+            {
+                LogInfo("Assessment", "Alcohol value missing -> using warning/unknown instead of red");
+            }
+            LogInfo("Assessment", $"Alcohol raw value used for assessment: {(measurement is null ? "null" : measurement.AlcoholLevel.ToString("F2", System.Globalization.CultureInfo.InvariantCulture))}");
+            LogInfo("Assessment", $"Alcohol status rule branch selected: {GetAlcoholRuleBranchName(measurement, alcoholStatus)}");
+            LogInfo("Assessment", $"Pressure raw values used for assessment: SYS={(measurement is null ? "null" : measurement.BloodPressureSystolic.ToString("F0", System.Globalization.CultureInfo.InvariantCulture))}, DAD={(measurement is null ? "null" : measurement.BloodPressureDiastolic.ToString("F0", System.Globalization.CultureInfo.InvariantCulture))}");
+            LogInfo("Assessment", $"Temperature raw value used for assessment: {(measurement is null ? "null" : measurement.Temperature.ToString("F2", System.Globalization.CultureInfo.InvariantCulture))}");
+
+            LogInfo("Assessment", $"Alcohol status evaluated: {alcoholStatus.ToString().ToLowerInvariant()}");
+            LogInfo("Assessment", $"Pressure status evaluated: {pressureStatus.ToString().ToLowerInvariant()}");
+            LogInfo("Assessment", $"Temperature status evaluated: {temperatureStatus.ToString().ToLowerInvariant()}");
+
+            employeeOverallStatus = EvaluateOverallStatus(alcoholStatus, pressureStatus, temperatureStatus);
+            LogInfo("Assessment", $"Overall verdict composed from: alcohol={alcoholStatus.ToString().ToLowerInvariant()}, pressure={pressureStatus.ToString().ToLowerInvariant()}, temperature={temperatureStatus.ToString().ToLowerInvariant()}");
+            LogInfo("Assessment", $"Employee overall status: {employeeOverallStatus.ToString().ToLowerInvariant()}");
+
+            VerdictColor = employeeOverallStatus switch
+            {
+                EmployeeOverallStatus.Healthy => Brushes.Green,
+                EmployeeOverallStatus.Risk => Brushes.Red,
+                EmployeeOverallStatus.Warning => Brushes.Goldenrod,
+                _ => Brushes.Goldenrod
+            };
+
+            FinalVerdict = verdictPresentation.Status;
+            VerdictReason = verdictPresentation.Reason;
+            VerdictRecommendation = verdictPresentation.Recommendation;
+            IsVerdictVisible = true;
+
+            var borderColor = employeeOverallStatus switch
+            {
+                EmployeeOverallStatus.Healthy => "green",
+                EmployeeOverallStatus.Risk => "red",
+                EmployeeOverallStatus.Warning => "yellow",
+                _ => "yellow"
+            };
+            LogInfo("Assessment", $"UI border color set to: {borderColor}");
+        }
+
+        private static VerdictPresentation BuildVerdictPresentation(
+            VitalMeasurement? measurement,
+            MeasurementStatus alcoholStatus,
+            MeasurementStatus pressureStatus,
+            MeasurementStatus temperatureStatus)
+        {
+            var riskReasons = new List<string>();
+            var warningReasons = new List<string>();
+
+            if (alcoholStatus == MeasurementStatus.Risk)
+            {
+                riskReasons.Add("Обнаружен алкоголь");
+            }
+            else if (measurement is not null && !measurement.HasAlcoholValue)
+            {
+                warningReasons.Add("Данные алкоголя не получены");
+            }
+            else if (alcoholStatus == MeasurementStatus.Warning)
+            {
+                warningReasons.Add("Пограничное значение алкоголя");
+            }
+
+            if (temperatureStatus == MeasurementStatus.Risk)
+            {
+                riskReasons.Add("Повышенная температура");
+            }
+            else if (temperatureStatus is MeasurementStatus.Warning or MeasurementStatus.Unknown)
+            {
+                warningReasons.Add("Данные получены не полностью");
+            }
+
+            if (measurement is not null
+                && (measurement.BloodPressureSystolic == 255 || measurement.BloodPressureDiastolic == 255))
+            {
+                warningReasons.Add("Данные давления не получены");
+            }
+            else if (pressureStatus == MeasurementStatus.Risk)
+            {
+                riskReasons.Add(DescribePressureRiskReason(measurement));
+            }
+            else if (pressureStatus is MeasurementStatus.Warning or MeasurementStatus.Unknown or MeasurementStatus.Invalid)
+            {
+                warningReasons.Add("Данные давления не получены");
+            }
+
+            if (riskReasons.Count > 0)
+            {
+                return new VerdictPresentation(
+                    "Требуется внимание",
+                    JoinReasons(riskReasons),
+                    "Обратитесь к медицинскому персоналу учреждения");
+            }
+
+            if (warningReasons.Count > 0)
+            {
+                var reason = JoinReasons(warningReasons);
+                var recommendation = warningReasons.Contains("Пограничное значение алкоголя")
+                    && warningReasons.Count == 1
+                    ? "Требуется дополнительная проверка"
+                    : "Повторите измерение";
+
+                return new VerdictPresentation(
+                    "Требуется повторное измерение",
+                    reason,
+                    recommendation);
+            }
+
+            return new VerdictPresentation(
+                "Допуск разрешён",
+                "Показатели в допустимом диапазоне",
+                "Сотрудник может быть допущен к работе");
+        }
+
+        private static string DescribePressureRiskReason(VitalMeasurement? measurement)
+        {
+            if (measurement is null)
+            {
+                return "Давление вне нормы";
+            }
+
+            var systolicHigh = measurement.BloodPressureSystolic > 140;
+            var diastolicHigh = measurement.BloodPressureDiastolic > 90;
+            if (systolicHigh || diastolicHigh)
+            {
+                return "Повышенное давление";
+            }
+
+            var systolicLow = measurement.BloodPressureSystolic < 105;
+            var diastolicLow = measurement.BloodPressureDiastolic < 50;
+            if (systolicLow || diastolicLow)
+            {
+                return "Пониженное давление";
+            }
+
+            return "Давление вне нормы";
+        }
+
+        private static string JoinReasons(IReadOnlyList<string> reasons)
+        {
+            return string.Join(" и ", reasons.Distinct(StringComparer.Ordinal));
+        }
+
+        private static MeasurementStatus EvaluateAlcoholStatus(VitalMeasurement? measurement)
+        {
+            if (measurement is null)
+            {
+                return MeasurementStatus.Unknown;
+            }
+
+            if (!measurement.HasAlcoholValue)
+            {
+                return MeasurementStatus.Warning;
+            }
+
+            if (measurement.AlcoholLevel < 0 || measurement.AlcoholLevel > 4095)
+            {
+                return MeasurementStatus.Unknown;
+            }
+
+            if (measurement.AlcoholLevel > 3000)
+            {
+                return MeasurementStatus.Healthy;
+            }
+
+            if (measurement.AlcoholLevel < 1000)
+            {
+                return MeasurementStatus.Risk;
+            }
+
+            return MeasurementStatus.Warning;
+        }
+
+        private static MeasurementStatus EvaluatePressureStatus(VitalMeasurement? measurement)
+        {
+            if (measurement is null)
+            {
+                return MeasurementStatus.Unknown;
+            }
+
+            if (measurement.BloodPressureSystolic == 255 || measurement.BloodPressureDiastolic == 255)
+            {
+                return MeasurementStatus.Warning;
+            }
+
+            if (measurement.BloodPressureSystolic <= 0 || measurement.BloodPressureDiastolic <= 0)
+            {
+                return MeasurementStatus.Warning;
+            }
+
+            var isHealthy = measurement.BloodPressureSystolic >= 105
+                && measurement.BloodPressureSystolic <= 140
+                && measurement.BloodPressureDiastolic >= 50
+                && measurement.BloodPressureDiastolic <= 90;
+
+            return isHealthy ? MeasurementStatus.Healthy : MeasurementStatus.Risk;
+        }
+
+        private static MeasurementStatus EvaluateTemperatureStatus(VitalMeasurement? measurement)
+        {
+            if (measurement is null || measurement.Temperature <= 0)
+            {
+                return MeasurementStatus.Warning;
+            }
+
+            return measurement.Temperature > 35
+                ? MeasurementStatus.Risk
+                : MeasurementStatus.Healthy;
+        }
+
+        private static EmployeeOverallStatus EvaluateOverallStatus(
+            MeasurementStatus alcoholStatus,
+            MeasurementStatus pressureStatus,
+            MeasurementStatus temperatureStatus)
+        {
+            var statuses = new[] { alcoholStatus, pressureStatus, temperatureStatus };
+            if (statuses.Any(status => status == MeasurementStatus.Risk))
+            {
+                return EmployeeOverallStatus.Risk;
+            }
+
+            if (statuses.Any(status => status is MeasurementStatus.Warning or MeasurementStatus.Unknown or MeasurementStatus.Invalid))
+            {
+                return EmployeeOverallStatus.Warning;
+            }
+
+            if (statuses.All(status => status == MeasurementStatus.Healthy))
+            {
+                return EmployeeOverallStatus.Healthy;
+            }
+
+            return EmployeeOverallStatus.Warning;
+        }
+
+        private static string GetAlcoholRuleBranchName(VitalMeasurement? measurement, MeasurementStatus alcoholStatus)
+        {
+            if (measurement is null || !measurement.HasAlcoholValue)
+            {
+                return "warning-no-data";
+            }
+
+            return alcoholStatus switch
+            {
+                MeasurementStatus.Healthy => "green",
+                MeasurementStatus.Risk => "red",
+                MeasurementStatus.Warning => "yellow",
+                _ => "unknown"
+            };
+        }
+
+        private enum MeasurementStatus
+        {
+            Unknown,
+            Healthy,
+            Risk,
+            Warning,
+            Invalid
+        }
+
+        private enum EmployeeOverallStatus
+        {
+            Unknown,
+            Healthy,
+            Risk,
+            Warning
+        }
+
+        private sealed record VerdictPresentation(string Status, string Reason, string Recommendation);
+
         private DeviceRuntimeConfig LoadDeviceRuntimeConfig()
         {
             var configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, DeviceConfigFileName);
@@ -2177,10 +2713,55 @@ namespace SmartWatchProj.ViewModels
             }
         }
 
+        private void SaveDeviceRuntimeConfig(Action<DeviceRuntimeConfig> update)
+        {
+            var configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, DeviceConfigFileName);
+            var currentConfig = LoadDeviceRuntimeConfig();
+            update(currentConfig);
+
+            try
+            {
+                var json = JsonSerializer.Serialize(currentConfig, new JsonSerializerOptions
+                {
+                    WriteIndented = true
+                });
+                File.WriteAllText(configPath, json);
+            }
+            catch (Exception ex)
+            {
+                LogWarning("Config", $"Failed to save {DeviceConfigFileName}: {ex.Message}");
+            }
+        }
+
+        private static bool TryBuildSyncEndpointUrl(string? serverIp, out string endpointUrl, out string validationError)
+        {
+            endpointUrl = string.Empty;
+            validationError = string.Empty;
+
+            if (string.IsNullOrWhiteSpace(serverIp))
+            {
+                validationError = "не задан IP сервера сайта";
+                return false;
+            }
+
+            if (!IPAddress.TryParse(serverIp.Trim(), out var ipAddress))
+            {
+                validationError = $"некорректный IP '{serverIp}'";
+                return false;
+            }
+
+            endpointUrl = $"http://{ipAddress}:3001/api/measurements";
+            return true;
+        }
+
         private sealed class DeviceRuntimeConfig
         {
-            public int CameraRotation { get; init; }
-            public bool LinuxNoCameraMode { get; init; }
+            public int CameraRotation { get; set; }
+            public bool LinuxNoCameraMode { get; set; }
+            public string? ServerIp { get; set; }
+
+            [JsonExtensionData]
+            public Dictionary<string, JsonElement>? AdditionalData { get; set; }
         }
 
         
@@ -2215,59 +2796,34 @@ namespace SmartWatchProj.ViewModels
         /// </summary>
         private (string verdict, Avalonia.Media.IBrush color, List<HealthTile> tiles) CalculateDetailedDiagnosis(VitalMeasurement m)
         {
-            var tiles = new List<HealthTile>();
-            var random = new Random();  // Для вариативности текстов
+            var alcoholStatus = EvaluateAlcoholStatus(m);
+            var pressureStatus = EvaluatePressureStatus(m);
+            var temperatureStatus = EvaluateTemperatureStatus(m);
+            var overallStatus = EvaluateOverallStatus(alcoholStatus, pressureStatus, temperatureStatus);
 
-            // Шаблоны советов для каждого уровня (массивы для случайного выбора)
-            string[] lowAdvice = { "Обратитесь к врачу для проверки.", "Рекомендуем отдохнуть и проконсультироваться." };
-            string[] warningAdvice = { "Мониторьте состояние, избегайте нагрузок.", "Возможно, нужна корректировка образа жизни." };
-            string[] normalAdvice = { "Всё в порядке, продолжайте в том же духе.", "Нормальные показатели, поддерживайте баланс." };
-            string[] highAdvice = { "Срочно к специалисту!", "Избегайте физических нагрузок до обследования." };
+            var tiles = new List<HealthTile>
+            {
+                BuildAssessmentTile("Алкоголь", m.HasAlcoholValue ? m.AlcoholLevel.ToString("F0") : "нет данных", alcoholStatus),
+                BuildAssessmentTile("Температура", m.Temperature.ToString("F2"), temperatureStatus),
+                BuildAssessmentTile("Давление", $"{m.BloodPressureSystolic:F0}/{m.BloodPressureDiastolic:F0}", pressureStatus)
+            };
 
-            // ЧСС
-            string hrAdvice = "";
-            if (m.HeartRate < 50) { tiles.Add(new HealthTile("ЧСС", $"{m.HeartRate:F0}", "Очень низкая", highAdvice[random.Next(highAdvice.Length)], Avalonia.Media.Brushes.Red)); }
-            else if (m.HeartRate < 60) { tiles.Add(new HealthTile("ЧСС", $"{m.HeartRate:F0}", "Низкая", warningAdvice[random.Next(warningAdvice.Length)], Avalonia.Media.Brushes.Orange)); }
-            else if (m.HeartRate <= 100) { tiles.Add(new HealthTile("ЧСС", $"{m.HeartRate:F0}", "Норма", normalAdvice[random.Next(normalAdvice.Length)], Avalonia.Media.Brushes.Green)); }
-            else if (m.HeartRate <= 120) { tiles.Add(new HealthTile("ЧСС", $"{m.HeartRate:F0}", "Повышенная", warningAdvice[random.Next(warningAdvice.Length)], Avalonia.Media.Brushes.Orange)); }
-            else { tiles.Add(new HealthTile("ЧСС", $"{m.HeartRate:F0}", "Тахикардия", highAdvice[random.Next(highAdvice.Length)], Avalonia.Media.Brushes.Red)); }
+            return overallStatus switch
+            {
+                EmployeeOverallStatus.Healthy => ("Зелёный", Brushes.Green, tiles),
+                EmployeeOverallStatus.Risk => ("Красный", Brushes.Red, tiles),
+                _ => ("Жёлтый", Brushes.Goldenrod, tiles)
+            };
+        }
 
-            // Сатурация (аналогично, добавьте шаблоны)
-            if (m.Saturation >= 98) tiles.Add(new HealthTile("SpO₂", $"{m.Saturation}%", "Отлично", normalAdvice[random.Next(normalAdvice.Length)], Avalonia.Media.Brushes.Green));
-            else if (m.Saturation >= 95) tiles.Add(new HealthTile("SpO₂", $"{m.Saturation}%", "Норма", normalAdvice[random.Next(normalAdvice.Length)], Avalonia.Media.Brushes.Green));
-            else if (m.Saturation >= 92) tiles.Add(new HealthTile("SpO₂", $"{m.Saturation}%", "Снижена", warningAdvice[random.Next(warningAdvice.Length)], Avalonia.Media.Brushes.Orange));
-            else tiles.Add(new HealthTile("SpO₂", $"{m.Saturation}%", "Гипоксия", highAdvice[random.Next(highAdvice.Length)], Avalonia.Media.Brushes.Red));
-
-            // Давление (добавьте специфические советы)
-            string bp = $"{m.BloodPressureSystolic:F0}/{m.BloodPressureDiastolic:F0}";
-            string[] bpHighAdvice = { "Контролируйте давление, избегайте соли и стресса.", "Рекомендуем измерять ежедневно." };
-            if (m.BloodPressureSystolic < 90 || m.BloodPressureDiastolic < 60)
-                tiles.Add(new HealthTile("АД", bp, "Гипотония", lowAdvice[random.Next(lowAdvice.Length)], Avalonia.Media.Brushes.Orange));
-            else if (m.BloodPressureSystolic <= 129 && m.BloodPressureDiastolic <= 84)
-                tiles.Add(new HealthTile("АД", bp, "Идеальное", normalAdvice[random.Next(normalAdvice.Length)], Avalonia.Media.Brushes.Green));
-            else if (m.BloodPressureSystolic <= 139 || m.BloodPressureDiastolic <= 89)
-                tiles.Add(new HealthTile("АД", bp, "Норма", normalAdvice[random.Next(normalAdvice.Length)], Avalonia.Media.Brushes.Green));
-            else if (m.BloodPressureSystolic <= 159 || m.BloodPressureDiastolic <= 99)
-                tiles.Add(new HealthTile("АД", bp, "Гипертония I", warningAdvice[random.Next(warningAdvice.Length)], Avalonia.Media.Brushes.Orange));
-            else
-                tiles.Add(new HealthTile("АД", bp, "Гипертония II+", bpHighAdvice[random.Next(bpHighAdvice.Length)], Avalonia.Media.Brushes.Red));
-
-            // Температура, Глюкоза, Холестерин, Алкоголь, Активность — аналогично добавьте шаблоны с random.Next()
-            // ... (скопируйте структуру из вашего кода, добавив Advice как выше)
-
-            // Общий вердикт (без изменений)
-            bool hasCritical = tiles.Any(t => t.Color == Avalonia.Media.Brushes.Red || t.Color == Avalonia.Media.Brushes.DarkRed);
-            bool hasWarning = tiles.Any(t => t.Color == Avalonia.Media.Brushes.Orange || t.Color == Avalonia.Media.Brushes.Yellow);
-
-            string verdict = hasCritical ? "Риск" :
-                             hasWarning ? "Внимание" :
-                                           "Норма";
-
-            var verdictColor = hasCritical ? Avalonia.Media.Brushes.Red :
-                               hasWarning ? Avalonia.Media.Brushes.Orange :
-                                             Avalonia.Media.Brushes.Green;
-
-            return (verdict, verdictColor, tiles);
+        private static HealthTile BuildAssessmentTile(string title, string value, MeasurementStatus status)
+        {
+            return status switch
+            {
+                MeasurementStatus.Healthy => new HealthTile(title, value, "Норма", "Показатель в пределах нормы.", Brushes.Green),
+                MeasurementStatus.Risk => new HealthTile(title, value, "Риск", "Показатель требует внимания.", Brushes.Red),
+                _ => new HealthTile(title, value, "Предупреждение", "Данных недостаточно или показатель пограничный.", Brushes.Goldenrod)
+            };
         }
 
 

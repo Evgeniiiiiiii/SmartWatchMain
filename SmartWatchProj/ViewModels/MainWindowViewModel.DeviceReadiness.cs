@@ -9,6 +9,7 @@ using SmartWatchProj.Services.Diagnostics;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -91,6 +92,29 @@ namespace SmartWatchProj.ViewModels
             ? Brushes.SteelBlue
             : Brushes.DarkOliveGreen;
 
+        private void EnsureReadinessLayerInitializedForRuntime()
+        {
+            DeviceStatuses ??= new ObservableCollection<DeviceStatusSnapshot>();
+            LogEntries ??= new ObservableCollection<AppLogEntry>();
+
+            if (runtimeLogStore is not null
+                && devicePreflightService is not null
+                && diagnosticsMeasurementProvider is not null
+                && hardwareMeasurementProvider is not null)
+            {
+                return;
+            }
+
+            try
+            {
+                InitializeReadinessLayer();
+            }
+            catch (Exception ex)
+            {
+                WriteFallbackLog("Error", "Startup", $"Readiness layer initialization failed during runtime recovery: {ex}");
+            }
+        }
+
         private void InitializeReadinessLayer()
         {
             var baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
@@ -103,6 +127,13 @@ namespace SmartWatchProj.ViewModels
             {
                 IsDiagnosticsModeEnabled = false;
             }
+
+            var runtimeConfig = LoadDeviceRuntimeConfig();
+            AppliedServerIp = runtimeConfig.ServerIp ?? string.Empty;
+            ServerIp = AppliedServerIp;
+            SyncMessage = string.IsNullOrWhiteSpace(AppliedServerIp)
+                ? "IP сервера сайта не задан."
+                : $"Применено: {SyncEndpointUrl}";
 
             UpdateRunModeText();
             UpdateEmployeeStatus();
@@ -550,20 +581,17 @@ namespace SmartWatchProj.ViewModels
 
         private void LogInfo(string source, string message)
         {
-            runtimeLogStore.Info(source, message);
-            PublishRecentLogs();
+            SafeLog("Info", source, message, static (store, src, msg) => store.Info(src, msg));
         }
 
         private void LogWarning(string source, string message)
         {
-            runtimeLogStore.Warning(source, message);
-            PublishRecentLogs();
+            SafeLog("Warning", source, message, static (store, src, msg) => store.Warning(src, msg));
         }
 
         private void LogError(string source, string message)
         {
-            runtimeLogStore.Error(source, message);
-            PublishRecentLogs();
+            SafeLog("Error", source, message, static (store, src, msg) => store.Error(src, msg));
         }
 
         private void PublishRecentLogs()
@@ -575,6 +603,70 @@ namespace SmartWatchProj.ViewModels
 
             LogEntries = new ObservableCollection<AppLogEntry>(
                 runtimeLogStore.GetRecentEntries());
+        }
+
+        private void SafeLog(
+            string level,
+            string source,
+            string message,
+            Action<RuntimeLogStore, string, string> writeToStore)
+        {
+            source ??= "Unknown";
+            message ??= string.Empty;
+
+            try
+            {
+                if (runtimeLogStore is null)
+                {
+                    WriteFallbackLog(level, source, $"{message} | LogError fallback to console because UI log target is null.");
+                    return;
+                }
+
+                writeToStore(runtimeLogStore, source, message);
+            }
+            catch (Exception ex)
+            {
+                WriteFallbackLog(level, source, $"{message} | Runtime log store write failed: {ex.Message}");
+                return;
+            }
+
+            try
+            {
+                PublishRecentLogs();
+            }
+            catch (Exception ex)
+            {
+                WriteFallbackLog(level, source, $"{message} | UI log publish skipped: {ex.Message}");
+            }
+        }
+
+        private static void WriteFallbackLog(string level, string source, string message)
+        {
+            var line = $"[{DateTime.Now:O}] [{level}] [{source}] {message}";
+
+            try
+            {
+                Console.WriteLine(line);
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                Debug.WriteLine(line);
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                Trace.WriteLine(line);
+            }
+            catch
+            {
+            }
         }
     }
 }

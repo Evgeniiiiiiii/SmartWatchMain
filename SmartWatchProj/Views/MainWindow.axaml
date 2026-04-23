@@ -177,12 +177,12 @@
 					 HorizontalAlignment="Center"/>
 
 			<TextBox Watermark="ФИО сотрудника"
-					 Text="{Binding NewEmployeeName}"
+					 Text="{Binding NewEmployeeName, UpdateSourceTrigger=PropertyChanged}"
 					 Width="260"
 					 HorizontalAlignment="Center"/>
 
 			<TextBox Watermark="CardId"
-					 Text="{Binding NewCardId}"
+					 Text="{Binding NewCardId, UpdateSourceTrigger=PropertyChanged}"
 					 Width="260"
 					 HorizontalAlignment="Center"/>
 
@@ -207,7 +207,7 @@
 					HorizontalContentAlignment="Center"/>
 
 			<TextBlock Text="{Binding StartAvailabilityReason}"
-					   IsVisible="{Binding !CanStartWorkflow}"
+					   IsVisible="False"
 					   Width="260"
 					   TextWrapping="Wrap"
 					   FontSize="12"
@@ -223,12 +223,14 @@
 					Background="#C62828"/>
 
 			<ProgressBar IsIndeterminate="{Binding IsCollectingData}"
+						 IsVisible="False"
 						 Height="18"
 						 Width="260"
 						 Margin="0,8,0,0"
 						 HorizontalAlignment="Center"/>
 
 			<TextBlock Text="{Binding HardwareSafetyStatus}"
+					   IsVisible="False"
 					   Width="260"
 					   TextWrapping="Wrap"
 					   FontSize="12"
@@ -238,14 +240,14 @@
 
 			<!-- ВЕРХНЯЯ панель: только ошибки от кнопок/ввода -->
 			<TextBlock Text="{Binding CameraModeStatusText}"
-					   IsVisible="{Binding IsNoCameraModeEnabled}"
+					   IsVisible="False"
 					   Width="260"
 					   TextWrapping="Wrap"
 					   FontSize="12"
 					   Foreground="#7A1F1F"
 					   TextAlignment="Center"/>
 
-			<Border IsVisible="{Binding IsTopInfoVisible}"
+			<Border IsVisible="False"
 					Background="#FFFFFF"
 					CornerRadius="14"
 					BorderBrush="#22000000"
@@ -377,6 +379,7 @@
 
 		<!-- Сообщения/ошибки: компактная карточка -->
 		<Border Grid.Row="2" Grid.Column="0"
+				IsVisible="False"
 				Background="#FFFFFF"
 				CornerRadius="14"
 				Padding="0"
@@ -440,6 +443,7 @@
 
 		<!-- Окно рекомендаций: адаптивно -->
 		<Border Grid.Row="2" Grid.Column="1"
+				IsVisible="{Binding IsVerdictVisible}"
 				Background="White"
 				CornerRadius="20"
 				Padding="16"
@@ -452,12 +456,30 @@
 				Margin="0,0,0,10">
 
 			<!-- если текст длинный — будет прокрутка, и блок не раздуется -->
-			<ScrollViewer MaxHeight="160">
-				<TextBlock Text="{Binding HumanRecommendation}"
+			<StackPanel Spacing="10"
+						VerticalAlignment="Center"
+						HorizontalAlignment="Center">
+				<TextBlock Text="{Binding FinalVerdict}"
 						   TextWrapping="Wrap"
-						   FontSize="14"
+						   FontSize="28"
+						   FontWeight="SemiBold"
+						   TextAlignment="Center"
+						   HorizontalAlignment="Center"
+						   Foreground="{Binding VerdictColor}" />
+				<TextBlock Text="{Binding VerdictReason}"
+						   TextWrapping="Wrap"
+						   FontSize="18"
+						   FontWeight="SemiBold"
+						   TextAlignment="Center"
+						   HorizontalAlignment="Center"
 						   Foreground="Black" />
-			</ScrollViewer>
+				<TextBlock Text="{Binding VerdictRecommendation}"
+						   TextWrapping="Wrap"
+						   FontSize="16"
+						   TextAlignment="Center"
+						   HorizontalAlignment="Center"
+						   Foreground="#333333" />
+			</StackPanel>
 		</Border>
 
 
@@ -465,6 +487,7 @@
 
 		<!-- История измерений: Фиксированный размер (не расширяется автоматически), верх выровнен с камерой -->
 		<StackPanel Grid.Row="1" Grid.Column="2" Grid.RowSpan="2"
+					IsVisible="False"
 					Margin="20,0,0,0" VerticalAlignment="Top" MaxHeight="600">
 
 			<TextBlock Text="История измерений" FontSize="18" FontWeight="SemiBold" Margin="0,0,0,10" />
@@ -523,6 +546,7 @@
 
 		<!-- Нижняя зона: подпись + плитки параметров -->
 		<StackPanel Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="3"
+					IsVisible="False"
 					HorizontalAlignment="Center"
 					VerticalAlignment="Bottom"
 					Margin="0,20,0,20"
@@ -608,7 +632,7 @@
 
 
 		<!-- Статусная панель: Внизу по центру -->
-        <StackPanel Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="3" Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,0,0,20">
+        <StackPanel Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="3" Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,0,0,20" IsVisible="False">
             <TextBlock Text="{Binding Source={x:Static sys:DateTime.Now}, StringFormat='Дата/время: {0:dd.MM.yyyy HH:mm}'}" FontSize="14" Margin="0,0,20,0" />
             <TextBlock x:Name="StatusText" Text="Статус: Камера и YOLO готовы" FontSize="14" Foreground="#388E3C" />
         </StackPanel>
@@ -619,6 +643,15 @@
         <!-- Кнопка выхода: Внизу справа, не наезжает -->
 		<Button Grid.Row="4" Grid.Column="2" Content="Завершить и выйти" Command="{Binding FinishAndExitCommand}" Width="200" HorizontalContentAlignment="Center" Margin="0,0,10,0" HorizontalAlignment="Right" VerticalAlignment="Bottom" Padding="16,8" />
 
+		<TextBlock Grid.Row="4" Grid.Column="0"
+				   IsVisible="False"
+				   Text="{Binding SyncMessage}"
+				   FontSize="11"
+				   TextWrapping="Wrap"
+				   MaxWidth="320"
+				   HorizontalAlignment="Left"
+				   VerticalAlignment="Bottom"
+				   Margin="10,0,0,44" />
     </Grid>
 
 		<Border IsVisible="{Binding IsDevicePanelOpen}"
@@ -691,6 +724,30 @@
 										   FontSize="12"
 										   FontWeight="SemiBold"
 										   TextWrapping="Wrap"/>
+								<TextBlock Text="IP сервера сайта"
+										   FontSize="12"
+										   FontWeight="SemiBold"
+										   Margin="0,4,0,0"/>
+								<Grid ColumnDefinitions="*,Auto"
+									  ColumnSpacing="8">
+									<TextBox Text="{Binding ServerIp}"
+											 Watermark="РќР°РїСЂРёРјРµСЂ, 192.168.1.10"/>
+									<Button Grid.Column="1"
+											Content="Применить"
+											Command="{Binding ApplyServerIpCommand}"
+											Padding="12,6"
+											HorizontalAlignment="Right"/>
+								</Grid>
+								<TextBox IsVisible="False" Text="{Binding ServerIp}"
+										 Watermark="Например, 192.168.1.10"/>
+								<TextBlock Text="{Binding SyncEndpointUrl, StringFormat='URL sync: {0}'}"
+										   FontSize="11"
+										   TextWrapping="Wrap"
+										   Opacity="0.85"/>
+								<TextBlock Text="{Binding SyncMessage}"
+										   FontSize="11"
+										   TextWrapping="Wrap"
+										   Foreground="#8A2C0A"/>
 							</StackPanel>
 						</Border>
 
@@ -942,6 +999,20 @@
 								   TextAlignment="Center"
 								   TextWrapping="Wrap"
 								   Foreground="#000000"/>
+
+						<TextBlock Text="{Binding PressurePrepCountdownText}"
+								   IsVisible="{Binding IsPressurePrepActive}"
+								   FontSize="13"
+								   TextAlignment="Center"
+								   TextWrapping="Wrap"
+								   Foreground="#5A5A5A"/>
+
+						<Button Content="Старт"
+								Command="{Binding StartPressurePrepCommand}"
+								IsVisible="{Binding IsPressurePrepActive}"
+								HorizontalAlignment="Center"
+								Width="160"
+								Background="#2E7D32"/>
 
 						<ProgressBar Value="{Binding ProgressValue}"
 									 Minimum="0"

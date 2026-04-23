@@ -74,6 +74,8 @@ namespace SmartWatchProj.Services.Devices
                 Glucose = template.Glucose,
                 Cholesterol = template.Cholesterol,
                 AlcoholLevel = template.AlcoholLevel,
+                HasAlcoholValue = true,
+                AlcoholAssessmentSource = "debug-value",
                 Diagnosis = $"Diagnostics profile: {template.Name}"
             });
         }
@@ -182,6 +184,8 @@ namespace SmartWatchProj.Services.Devices
                 Timestamp = DateTime.Now,
                 Temperature = controllerResponse.Temp,
                 AlcoholLevel = controllerResponse.Alco,
+                HasAlcoholValue = controllerResponse.HasAlcoholValue,
+                AlcoholAssessmentSource = controllerResponse.AlcoholSource,
                 BloodPressureSystolic = controllerResponse.Sys,
                 BloodPressureDiastolic = controllerResponse.Dad,
                 Diagnosis = controllerResponse.ResultSummary
@@ -359,7 +363,9 @@ namespace SmartWatchProj.Services.Devices
 
             await ReportStageAsync(hooks, MeasurementWorkflowStage.PreparePressure, cancellationToken);
             await ReportStageAsync(hooks, MeasurementWorkflowStage.MeasurePressure, cancellationToken);
-            await WaitForMeasurementWindowAsync("pressure cuff preparation", controller.PressurePreparationDelayMs, cancellationToken);
+            logStore.Info("COM", "Pressure measurement dispatch starting after prep confirmation.");
+            ResetPressureMeasurementState(port);
+            logStore.Info("COM", $"Pressure command dispatch starting: {PressureCommand}");
             await SendControllerCommandAsync(port, PressureCommand, controller.DelayBetweenCommandsMs, cancellationToken);
             var pressureReadResult = await ReadPressureAndTryFinalJsonAsync(
                 port,
@@ -368,6 +374,7 @@ namespace SmartWatchProj.Services.Devices
                 cancellationToken,
                 "NIBP completion + SAD + DAD");
             await ReportStageAsync(hooks, MeasurementWorkflowStage.ProcessingResults, cancellationToken);
+
             var finalJsonPayload = pressureReadResult.FinalJsonPayload;
             if (!string.IsNullOrWhiteSpace(finalJsonPayload))
             {
@@ -377,27 +384,53 @@ namespace SmartWatchProj.Services.Devices
                 return new ControllerResponse(
                     finalJson.Temp,
                     finalJson.Alco,
+                    true,
+                    "final-json",
                     finalJson.Sys,
                     finalJson.Dad,
                     "final-json",
-                    BuildResultSummary(finalJson.Temp, finalJson.Alco, finalJson.Sys, finalJson.Dad, fromFinalJson: true));
+                    BuildResultSummary(finalJson.Temp, Math.Min(finalJson.Alco, 4094), finalJson.Sys, finalJson.Dad, fromFinalJson: true));
             }
 
-            var temperatureValue = RequireMeasurementValue(temperature, "temperature");
-            var alcoholValue = RequireMeasurementValue(alcohol, "alco");
-            var pressurePayload = pressureReadResult.PressurePayload;
-            var sad = ParseMatchedDouble(pressurePayload, SadRegexes, "SAD");
-            var dad = ParseMatchedDouble(pressurePayload, DadRegexes, "DAD");
-            logStore.Info("COM", $"Parsed SAD: {sad}");
-            logStore.Info("COM", $"Parsed DAD: {dad}");
-            logStore.Warning("COM", "JSON parse failed: final controller JSON not received, falling back to debug/raw readings.");
+            if (pressureReadResult.Status == PressureStepStatus.InvalidResult)
+            {
+                logStore.Warning("COM", $"Pressure step completed-with-invalid-pressure-data. Relevant={pressureReadResult.RelevantSummary}");
+                var resolvedTemperature = temperature ?? 0;
+                var resolvedAlcohol = alcohol ?? 0;
+                var hasAlcoholValue = alcohol.HasValue;
+                var alcoholSource = alcohol.HasValue ? "debug-value" : "missing";
+
+                if (pressureReadResult.InvalidPlaceholderFinalJsonPayload is { } invalidPlaceholderFinalJsonPayload)
+                {
+                    var invalidPlaceholderFinalJson = ParseFinalJsonPayload(invalidPlaceholderFinalJsonPayload);
+                    resolvedTemperature = invalidPlaceholderFinalJson.Temp;
+                    resolvedAlcohol = invalidPlaceholderFinalJson.Alco;
+                    hasAlcoholValue = true;
+                    alcoholSource = "final-json";
+                    logStore.Info("COM", $"Using alcohol from invalid pressure placeholder final JSON: Alco={invalidPlaceholderFinalJson.Alco}, Temp={invalidPlaceholderFinalJson.Temp}");
+                }
+
+                return new ControllerResponse(
+                    resolvedTemperature,
+                    Math.Min(resolvedAlcohol, 4094),
+                    hasAlcoholValue,
+                    alcoholSource,
+                    255,
+                    255,
+                    "pressure-invalid-placeholder",
+                    BuildResultSummary(resolvedTemperature, Math.Min(resolvedAlcohol, 4094), 255, 255, fromFinalJson: false));
+            }
+
+            logStore.Warning("COM", $"Pressure step completed-without-final-pressure-data. Status={pressureReadResult.Status}; Relevant={pressureReadResult.RelevantSummary}");
             return new ControllerResponse(
-                temperatureValue,
-                alcoholValue,
-                sad,
-                dad,
-                "debug-raw",
-                BuildResultSummary(temperatureValue, alcoholValue, sad, dad, fromFinalJson: false));
+                temperature ?? 0,
+                Math.Min(alcohol ?? 0, 4094),
+                alcohol.HasValue,
+                alcohol.HasValue ? "debug-value" : "missing",
+                0,
+                0,
+                pressureReadResult.Status == PressureStepStatus.NoData ? "pressure-no-data" : "pressure-timeout",
+                BuildResultSummary(temperature ?? 0, Math.Min(alcohol ?? 0, 4094), 0, 0, fromFinalJson: false));
         }
 
         private async Task<PressureAndFinalJsonReadResult> ReadPressureAndTryFinalJsonAsync(
@@ -409,15 +442,19 @@ namespace SmartWatchProj.Services.Devices
         {
             var effectivePressureTimeoutMs = Math.Max(pressureTimeoutMs, 35000);
             var pressureDeadline = DateTime.UtcNow.AddMilliseconds(effectivePressureTimeoutMs);
-            var finalJsonDeadline = pressureDeadline.AddMilliseconds(finalJsonTimeoutMs);
+            var hardDeadline = pressureDeadline.AddMilliseconds(Math.Max(finalJsonTimeoutMs, 0));
+            var currentDeadline = pressureDeadline;
             var combinedBuffer = string.Empty;
             var pressurePayload = string.Empty;
-            var pressureComplete = false;
+            var relevantEntries = new List<string>();
+            var pressureRelatedSeen = false;
+            var invalidPlaceholderSeen = false;
+            string? invalidPlaceholderFinalJsonPayload = null;
             string? lastParseFailureReason = null;
 
-            logStore.Info("COM", $"Pressure step waiting up to {effectivePressureTimeoutMs} ms for pressure/final JSON data.");
+            logStore.Info("COM", $"Pressure wait window started: timeout={effectivePressureTimeoutMs} ms, finalJsonTail={finalJsonTimeoutMs} ms, expected={expectedLabel}.");
 
-            while (DateTime.UtcNow < finalJsonDeadline)
+            while (DateTime.UtcNow < currentDeadline)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
@@ -426,67 +463,122 @@ namespace SmartWatchProj.Services.Devices
                 {
                     logStore.Info("COM", $"Raw chunk: {chunk}");
                     combinedBuffer += chunk;
-                    logStore.Info("COM", $"Current accumulated pressure buffer: {combinedBuffer}");
-
-                    if (!pressureComplete && TryParseFinalJsonCandidate(combinedBuffer, ref lastParseFailureReason, out var finalJsonCandidate))
+                    foreach (var line in SplitPressureChunkLines(chunk))
                     {
-                        logStore.Info("COM", "Pressure step accepted final JSON without requiring legacy NIBP debug logs.");
-                        return new PressureAndFinalJsonReadResult(pressurePayload, finalJsonCandidate);
+                        var classification = ClassifyPressureLine(line);
+                        logStore.Info("COM", $"Parsed line during pressure wait: {line}");
+
+                        switch (classification)
+                        {
+                            case PressureLineClassification.JsonCandidate:
+                                pressureRelatedSeen = true;
+                                relevantEntries.Add(line);
+                                logStore.Info("COM", $"Line classified as json-candidate: {line}");
+                                break;
+                            case PressureLineClassification.Relevant:
+                                pressureRelatedSeen = true;
+                                relevantEntries.Add(line);
+                                logStore.Info("COM", $"Line classified as relevant: {line}");
+                                break;
+                            default:
+                                logStore.Info("COM", $"Line classified as ignored: {line}. Reason: {GetPressureIgnoredReason(line)}");
+                                break;
+                        }
                     }
 
-                    if (!pressureComplete && HasMatch(combinedBuffer, PressureCompleteRegexes) && HasMatch(combinedBuffer, SadRegexes) && HasMatch(combinedBuffer, DadRegexes))
+                    if (string.IsNullOrWhiteSpace(pressurePayload)
+                        && HasMatch(combinedBuffer, PressureCompleteRegexes)
+                        && HasMatch(combinedBuffer, SadRegexes)
+                        && HasMatch(combinedBuffer, DadRegexes))
                     {
-                        pressureComplete = true;
                         pressurePayload = combinedBuffer;
+                    }
 
-                        var seededFinalBuffer = BuildFinalJsonSeedBuffer(combinedBuffer);
-                        if (!string.IsNullOrWhiteSpace(seededFinalBuffer))
+                    if (pressureRelatedSeen && finalJsonTimeoutMs > 0)
+                    {
+                        var extendedDeadline = DateTime.UtcNow.AddMilliseconds(finalJsonTimeoutMs);
+                        currentDeadline = extendedDeadline < hardDeadline ? extendedDeadline : hardDeadline;
+                    }
+
+                    while (TryExtractJsonCandidate(combinedBuffer, out var jsonCandidate, out var remainingBuffer))
+                    {
+                        combinedBuffer = remainingBuffer;
+                        pressureRelatedSeen = true;
+                        relevantEntries.Add($"json:{jsonCandidate}");
+                        logStore.Info("COM", $"Pressure raw JSON candidate: {jsonCandidate}");
+
+                        try
                         {
-                            logStore.Info("COM", $"Final JSON buffer updated: {seededFinalBuffer}");
-                            if (TryParseFinalJsonFromAccumulatedBuffer(ref seededFinalBuffer, ref lastParseFailureReason, out var inlineCandidate))
+                            var finalJson = ParseFinalJsonPayload(jsonCandidate);
+                            logStore.Info("COM", $"Recognized pressure final JSON: Temp={finalJson.Temp}, Alco={finalJson.Alco}, SYS={finalJson.Sys}, DAD={finalJson.Dad}");
+
+                            if (IsInvalidPressurePlaceholder(finalJson))
                             {
-                                return new PressureAndFinalJsonReadResult(pressurePayload, inlineCandidate);
+                                invalidPlaceholderSeen = true;
+                                invalidPlaceholderFinalJsonPayload = jsonCandidate;
+                                logStore.Warning("COM", $"Pressure final JSON is invalid placeholder/debug result 255/255: {jsonCandidate}");
+                                logStore.Warning("COM", "Pressure result rejected: invalid-result");
+                                continue;
                             }
-                        }
-                    }
-                    else if (pressureComplete)
-                    {
-                        var currentFinalBuffer = BuildFinalJsonSeedBuffer(combinedBuffer);
-                        logStore.Info("COM", $"Final JSON chunk received: {chunk}");
-                        logStore.Info("COM", $"Final JSON buffer updated: {currentFinalBuffer}");
-                        if (TryParseFinalJsonFromAccumulatedBuffer(ref currentFinalBuffer, ref lastParseFailureReason, out var candidate))
-                        {
-                            return new PressureAndFinalJsonReadResult(pressurePayload, candidate);
-                        }
-                    }
-                }
 
-                if (!pressureComplete)
-                {
-                    if (DateTime.UtcNow >= pressureDeadline)
-                    {
-                        throw new TimeoutException($"ESP32 controller did not return pressure logs or final JSON within {effectivePressureTimeoutMs} ms. Payload={combinedBuffer}");
+                            logStore.Info("COM", $"Pressure result accepted: SYS={finalJson.Sys}, DAD={finalJson.Dad}");
+                            logStore.Info("COM", "Pressure step status: success");
+                            return new PressureAndFinalJsonReadResult(
+                                pressurePayload,
+                                jsonCandidate,
+                                PressureStepStatus.Success,
+                                BuildRelevantSummary(relevantEntries),
+                                invalidPlaceholderFinalJsonPayload);
+                        }
+                        catch (Exception ex)
+                        {
+                            lastParseFailureReason = ex.Message;
+                            logStore.Warning("COM", $"Pressure JSON candidate rejected: {ex.Message}");
+                        }
                     }
-                }
-                else if (DateTime.UtcNow >= finalJsonDeadline)
-                {
-                    break;
                 }
 
                 await Task.Delay(100, cancellationToken);
             }
 
-            if (!pressureComplete)
+            if (invalidPlaceholderSeen)
             {
-                throw new TimeoutException($"ESP32 controller did not return pressure logs or final JSON within {effectivePressureTimeoutMs} ms. Payload={combinedBuffer}");
+                logStore.Warning("COM", $"Pressure step status: invalid-result. Relevant activity: {BuildRelevantSummary(relevantEntries)}");
+                return new PressureAndFinalJsonReadResult(
+                    pressurePayload,
+                    null,
+                    PressureStepStatus.InvalidResult,
+                    BuildRelevantSummary(relevantEntries),
+                    invalidPlaceholderFinalJsonPayload);
             }
 
-            if (!string.IsNullOrWhiteSpace(lastParseFailureReason))
+            if (pressureRelatedSeen)
             {
-                logStore.Warning("COM", $"Final JSON parse failed with reason: timeout after parse error ({lastParseFailureReason})");
+                if (!string.IsNullOrWhiteSpace(lastParseFailureReason))
+                {
+                    logStore.Warning("COM", $"Pressure-related messages arrived, but no valid final JSON was accepted before timeout. Last parse issue: {lastParseFailureReason}");
+                }
+                else
+                {
+                    logStore.Warning("COM", "Pressure-related messages arrived, but no valid final JSON was accepted before timeout.");
+                }
+
+                logStore.Warning("COM", $"Pressure step status: timeout. Relevant activity: {BuildRelevantSummary(relevantEntries)}");
+                return new PressureAndFinalJsonReadResult(
+                    pressurePayload,
+                    null,
+                    PressureStepStatus.Timeout,
+                    BuildRelevantSummary(relevantEntries),
+                    invalidPlaceholderFinalJsonPayload);
             }
 
-            return new PressureAndFinalJsonReadResult(pressurePayload, null);
+            logStore.Warning("COM", $"Pressure step status: no-data. No relevant pressure/final JSON data received within {effectivePressureTimeoutMs} ms.");
+            return new PressureAndFinalJsonReadResult(
+                pressurePayload,
+                null,
+                PressureStepStatus.NoData,
+                "none",
+                invalidPlaceholderFinalJsonPayload);
         }
 
         private static Task ReportStageAsync(
@@ -812,6 +904,79 @@ namespace SmartWatchProj.Services.Devices
                 : string.Empty;
         }
 
+        private void ResetPressureMeasurementState(SerialPort port)
+        {
+            if (!port.IsOpen)
+            {
+                return;
+            }
+
+            port.DiscardInBuffer();
+            logStore.Info("COM", "Pressure measurement stale state reset before x1x3x.");
+        }
+
+        private static IEnumerable<string> SplitPressureChunkLines(string chunk)
+        {
+            var entries = chunk
+                .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .ToList();
+
+            if (entries.Count == 0 && chunk.Contains('{'))
+            {
+                entries.Add(chunk.Trim());
+            }
+
+            return entries;
+        }
+
+        private static PressureLineClassification ClassifyPressureLine(string line)
+        {
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                return PressureLineClassification.Ignored;
+            }
+
+            if (line.Contains('{'))
+            {
+                return PressureLineClassification.JsonCandidate;
+            }
+
+            return line.Contains("NIBP", StringComparison.OrdinalIgnoreCase)
+                || line.Contains("pressure", StringComparison.OrdinalIgnoreCase)
+                || line.Contains("SAD", StringComparison.OrdinalIgnoreCase)
+                || line.Contains("DAD", StringComparison.OrdinalIgnoreCase)
+                || line.Contains("SYS", StringComparison.OrdinalIgnoreCase)
+                || line.Contains("Temp", StringComparison.OrdinalIgnoreCase)
+                || line.Contains("Alco", StringComparison.OrdinalIgnoreCase)
+                ? PressureLineClassification.Relevant
+                : PressureLineClassification.Ignored;
+        }
+
+        private static string GetPressureIgnoredReason(string line)
+        {
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                return "empty line";
+            }
+
+            return "no pressure/debug/final-json markers detected";
+        }
+
+        private static bool IsInvalidPressurePlaceholder(FinalJsonPayload payload) =>
+            payload.Sys == 255 && payload.Dad == 255;
+
+        private static string BuildRelevantSummary(IEnumerable<string> entries)
+        {
+            var materialized = entries
+                .Where(entry => !string.IsNullOrWhiteSpace(entry))
+                .TakeLast(6)
+                .ToArray();
+
+            return materialized.Length == 0
+                ? "none"
+                : string.Join(" | ", materialized);
+        }
+
         private FinalJsonPayload ParseFinalJsonPayload(string payload)
         {
             try
@@ -968,9 +1133,24 @@ namespace SmartWatchProj.Services.Devices
                 .Replace("\r", "\\r", StringComparison.Ordinal)
                 .Replace("\n", "\\n", StringComparison.Ordinal) + "\"";
 
-        private sealed record ControllerResponse(double Temp, double Alco, double Sys, double Dad, string SourceLabel, string ResultSummary);
+        private enum PressureStepStatus
+        {
+            Success,
+            InvalidResult,
+            Timeout,
+            NoData
+        }
+
+        private enum PressureLineClassification
+        {
+            Ignored,
+            Relevant,
+            JsonCandidate
+        }
+
+        private sealed record ControllerResponse(double Temp, double Alco, bool HasAlcoholValue, string AlcoholSource, double Sys, double Dad, string SourceLabel, string ResultSummary);
         private sealed record FinalJsonPayload(double Temp, double Alco, double Sys, double Dad);
-        private sealed record PressureAndFinalJsonReadResult(string PressurePayload, string? FinalJsonPayload);
+        private sealed record PressureAndFinalJsonReadResult(string PressurePayload, string? FinalJsonPayload, PressureStepStatus Status, string RelevantSummary, string? InvalidPlaceholderFinalJsonPayload);
         private sealed record OptionalDebugReadResult(string Payload, bool Matched);
 
         private sealed class DevicePortMapConfig
@@ -1002,7 +1182,7 @@ namespace SmartWatchProj.Services.Devices
             public int TemperatureRetryDelayMs { get; init; } = 1500;
             public int AlcoholPreparationDelayMs { get; init; } = 2500;
             public int AlcoholRetryDelayMs { get; init; } = 2000;
-            public int PressurePreparationDelayMs { get; init; } = 8000;
+            public int PressurePreparationDelayMs { get; init; } = 20000;
             public int FinalJsonTimeoutMs { get; init; } = 5000;
             public int BootBannerDrainTimeoutMs { get; init; } = 1200;
             public int ResetCommandDelayMs { get; init; } = 150;

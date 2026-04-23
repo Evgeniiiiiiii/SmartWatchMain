@@ -1,4 +1,5 @@
-﻿using System;
+using System;
+using System.Text.Json.Serialization;
 
 namespace SmartWatchProj.Models
 {
@@ -19,6 +20,12 @@ namespace SmartWatchProj.Models
         public double Glucose { get; set; }
         public double Cholesterol { get; set; }
         public double AlcoholLevel { get; set; }
+
+        [JsonIgnore]
+        public bool HasAlcoholValue { get; set; }
+
+        [JsonIgnore]
+        public string AlcoholAssessmentSource { get; set; } = "missing";
 
         public string? Diagnosis { get; set; }
         public string? Recommendation { get; set; } // "Зелёный", "Жёлтый", "Красный"
