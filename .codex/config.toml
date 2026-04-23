@@ -1,7 +1,2 @@
 model = "gpt-5.4"
-
-[project]
-name = "SmartWatchProj"
-
-[instructions]
-file = "AGENTS.md"
+model_instructions_file = "../AGENTS.md"
