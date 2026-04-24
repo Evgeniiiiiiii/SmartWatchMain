@@ -348,6 +348,9 @@ namespace SmartWatchProj.ViewModels
                 }
 
                 // Анализ и остальное
+                LogInfo("Assessment", $"measurement object before final assessment: {FormatMeasurementForLog(measurement)}");
+                EnsureRequiredMeasurementsForFinalAssessment(measurement);
+                LogInfo("Assessment", $"final assessment input values: {FormatMeasurementForLog(measurement)}");
                 LogInfo("Start", "Save measurement starting");
                 var (verdict, verdictColor, healthTiles) = CalculateDetailedDiagnosis(measurement);
                 if (healthTiles is null)
@@ -379,7 +382,11 @@ namespace SmartWatchProj.ViewModels
                 ResultMessage = "Измерение прервано.";
                 ResultColor = Avalonia.Media.Brushes.DarkOrange;
                 HardwareSafetyStatus = "Аварийная остановка.";
+                LogWarning("Start", "failure verdict triggered only after final measurement validation");
+                PrepareMeasurementFailureVerdict(new[] { "Измерение прервано" }, "Проверьте подключение оборудования и повторите измерение");
                 LogWarning("Start", "Runtime stage failed: measurement cancelled.");
+                LogInfo("Start", "verdict shown after runtime failure");
+                LogInfo("Start", $"final UI verdict state: visible={IsVerdictVisible}, color={VerdictColor}, status={FinalVerdict}");
             }
             catch (Exception ex)
             {
@@ -395,6 +402,10 @@ namespace SmartWatchProj.ViewModels
                     : "Измерение прервано";
                 LogError("Start", message);
                 LogError("Start", $"Start initialization failed but application remains alive: {ex}");
+                LogWarning("Start", "failure verdict triggered only after final measurement validation");
+                PrepareMeasurementFailureVerdict(BuildMeasurementFailureReasons(ex), "Проверьте подключение оборудования и повторите измерение");
+                LogInfo("Start", "verdict shown after runtime failure");
+                LogInfo("Start", $"final UI verdict state: visible={IsVerdictVisible}, color={VerdictColor}, status={FinalVerdict}");
                 Console.WriteLine($"Исключение в Start(): {ex}");
             }
             finally
@@ -473,6 +484,77 @@ namespace SmartWatchProj.ViewModels
             VerdictReason = string.Empty;
             VerdictRecommendation = string.Empty;
             VerdictColor = Brushes.Transparent;
+        }
+
+        private void PrepareMeasurementFailureVerdict(IEnumerable<string> reasons, string recommendation)
+        {
+            var materializedReasons = reasons
+                .Where(reason => !string.IsNullOrWhiteSpace(reason))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            if (materializedReasons.Length == 0)
+            {
+                materializedReasons = new[] { "Измерение завершилось ошибкой" };
+            }
+
+            FinalVerdict = "Измерение не завершено";
+            VerdictReason = string.Join(", ", materializedReasons);
+            VerdictRecommendation = string.IsNullOrWhiteSpace(recommendation)
+                ? "Повторите измерение"
+                : recommendation;
+            VerdictColor = Brushes.Red;
+            IsVerdictVisible = true;
+            ResultMessage = FinalVerdict;
+            ResultColor = VerdictColor;
+            HumanRecommendation = VerdictRecommendation;
+
+            LogWarning("Start", "measurement failure verdict prepared");
+            LogWarning("Start", $"measurement failure reasons: {VerdictReason}");
+        }
+
+        private static IEnumerable<string> BuildMeasurementFailureReasons(Exception exception)
+        {
+            var text = CollectExceptionText(exception);
+            var reasons = new List<string>();
+
+            if (text.Contains("temperature", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("Temp", StringComparison.OrdinalIgnoreCase))
+            {
+                reasons.Add("Не получены данные температуры");
+            }
+
+            if (text.Contains("alcohol", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("alco", StringComparison.OrdinalIgnoreCase))
+            {
+                reasons.Add("Не получены данные алкоголя");
+            }
+
+            if (text.Contains("pressure", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("SYS", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("DAD", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("NIBP", StringComparison.OrdinalIgnoreCase))
+            {
+                reasons.Add("Не получены данные давления");
+            }
+
+            if (reasons.Count == 0)
+            {
+                reasons.Add("Измерение завершилось ошибкой");
+            }
+
+            return reasons;
+        }
+
+        private static string CollectExceptionText(Exception exception)
+        {
+            var builder = new StringBuilder();
+            for (var current = exception; current is not null; current = current.InnerException)
+            {
+                builder.Append(current.Message).Append(' ');
+            }
+
+            return builder.ToString();
         }
 
         public string SyncEndpointUrl => TryBuildSyncEndpointUrl(AppliedServerIp, out var endpointUrl, out _) ? endpointUrl : string.Empty;
@@ -659,7 +741,12 @@ namespace SmartWatchProj.ViewModels
                 case MeasurementWorkflowStage.PrepareTemperature:
                     LogInfo("Start", "PrepareTemperature started");
                     LogInfo("Start", "Подготовка к температуре");
-                    await RunPreparationStageAsync("Поднесите руку/лоб к датчику температуры", seconds: 3, progressStart: 0, progressEnd: 12, cancellationToken);
+                    await RunMeasurementPreparationStageAsync(
+                        "Temperature",
+                        "Измерение температуры. Поднесите руку или лоб к датчику. При готовности нажмите старт",
+                        progressStart: 0,
+                        progressEnd: 12,
+                        cancellationToken);
                     LogInfo("Start", "PrepareTemperature completed");
                     return;
                 case MeasurementWorkflowStage.MeasureTemperature:
@@ -671,7 +758,12 @@ namespace SmartWatchProj.ViewModels
                 case MeasurementWorkflowStage.PrepareAlcohol:
                     LogInfo("Start", "PrepareAlcohol started");
                     LogInfo("Start", "Подготовка к алкотестеру");
-                    await RunPreparationStageAsync("Подготовьтесь к измерению алкоголя и выполните продув", seconds: 4, progressStart: 22, progressEnd: 40, cancellationToken);
+                    await RunMeasurementPreparationStageAsync(
+                        "Alcohol",
+                        "Измерение алкоголя. Выполните продув в алкотестер. При готовности нажмите старт",
+                        progressStart: 22,
+                        progressEnd: 40,
+                        cancellationToken);
                     LogInfo("Start", "PrepareAlcohol completed");
                     return;
                 case MeasurementWorkflowStage.MeasureAlcohol:
@@ -682,7 +774,12 @@ namespace SmartWatchProj.ViewModels
                 case MeasurementWorkflowStage.PreparePressure:
                     LogInfo("Start", "PreparePressure started");
                     LogInfo("Start", "Подготовка к давлению");
-                    await RunPressurePreparationStageAsync(cancellationToken);
+                    await RunMeasurementPreparationStageAsync(
+                        "Pressure",
+                        "Измерение давления. Пожалуйста, наденьте манжету и плотно закрепите на предплечье, при готовности нажмите старт",
+                        progressStart: 52,
+                        progressEnd: 72,
+                        cancellationToken);
                     LogInfo("Start", "PreparePressure completed");
                     return;
                 case MeasurementWorkflowStage.MeasurePressure:
@@ -726,14 +823,17 @@ namespace SmartWatchProj.ViewModels
             ProgressValue = progressEnd;
         }
 
-        private async Task RunPressurePreparationStageAsync(CancellationToken cancellationToken)
+        private async Task RunMeasurementPreparationStageAsync(
+            string stageName,
+            string instruction,
+            double progressStart,
+            double progressEnd,
+            CancellationToken cancellationToken)
         {
             const int totalSeconds = 30;
-            const double progressStart = 52;
-            const double progressEnd = 72;
 
-            LogInfo("Start", "Pressure prep screen shown");
-            CurrentInstruction = "Измерение давления. Пожалуйста, наденьте манжету и плотно закрепите на предплечье, при готовности нажмите старт";
+            LogInfo("Start", $"{stageName} prep screen shown");
+            CurrentInstruction = instruction;
             IsPressurePrepActive = true;
             pressurePrepCompletion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -743,7 +843,7 @@ namespace SmartWatchProj.ViewModels
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     PressurePrepCountdownText = $"В случае если кнопка не будет нажата, измерение начнется автоматически через: {remaining}";
-                    LogInfo("Start", $"Pressure prep auto-start countdown: {remaining}");
+                    LogInfo("Start", $"{stageName} prep auto-start countdown: {remaining}");
                     ProgressValue = progressStart + ((totalSeconds - remaining) / (double)totalSeconds) * (progressEnd - progressStart);
 
                     var delayTask = Task.Delay(1000, cancellationToken);
@@ -757,7 +857,7 @@ namespace SmartWatchProj.ViewModels
                     }
                 }
 
-                LogInfo("Start", "Pressure prep auto-start triggered");
+                LogInfo("Start", $"{stageName} prep auto-start triggered");
                 pressurePrepCompletion.TrySetResult(true);
                 ProgressValue = progressEnd;
                 PressurePrepCountdownText = string.Empty;
@@ -777,7 +877,7 @@ namespace SmartWatchProj.ViewModels
                 return;
             }
 
-            LogInfo("Start", "Pressure prep manual start clicked");
+            LogInfo("Start", "Measurement prep manual start clicked");
             pressurePrepCompletion.TrySetResult(true);
         }
 
@@ -1217,6 +1317,8 @@ namespace SmartWatchProj.ViewModels
             InstructionMessage = "Дуньте в алкотестер...";
             await Task.Delay(2000);
             measurement.AlcoholLevel = random.NextDouble() * 1.0;
+            measurement.HasAlcoholValue = true;
+            measurement.AlcoholAssessmentSource = "simulation";
             InstructionMessage = "Алкотестер: OK";
 
             InstructionMessage = "Приложите палец к датчику ЧСС/сатурации...";
@@ -1229,11 +1331,13 @@ namespace SmartWatchProj.ViewModels
             await Task.Delay(4000);
             measurement.BloodPressureSystolic = random.Next(85, 150);
             measurement.BloodPressureDiastolic = random.Next(55, 95);
+            measurement.HasPressureValue = true;
             InstructionMessage = "Давление: OK";
 
             InstructionMessage = "Измерьте температуру...";
             await Task.Delay(2000);
             measurement.Temperature = random.NextDouble() * (38.0 - 35.5) + 35.5;
+            measurement.HasTemperatureValue = true;
             InstructionMessage = "Температура: OK";
 
             InstructionMessage = "Измерьте глюкозу...";
@@ -2413,6 +2517,46 @@ namespace SmartWatchProj.ViewModels
             return rotated;
         }
 
+        private void EnsureRequiredMeasurementsForFinalAssessment(VitalMeasurement measurement)
+        {
+            var missing = GetMissingRequiredMeasurements(measurement).ToArray();
+            if (missing.Length == 0)
+            {
+                return;
+            }
+
+            var missingText = string.Join(", ", missing);
+            LogWarning("Assessment", "missing measurement declared only after exhausting all acquisition paths");
+            LogError("Assessment", $"detected missing required measurement: {missingText}");
+            LogError("Assessment", $"measurement flow failure reason: required measurements were not available before final assessment. {FormatMeasurementForLog(measurement)}");
+            throw new InvalidOperationException($"Измерение не завершено: не получены обязательные данные ({missingText}).");
+        }
+
+        private static IEnumerable<string> GetMissingRequiredMeasurements(VitalMeasurement measurement)
+        {
+            if (!measurement.HasTemperatureValue)
+            {
+                yield return "temperature";
+            }
+
+            if (!measurement.HasAlcoholValue || measurement.AlcoholLevel <= 0)
+            {
+                yield return "alcohol";
+            }
+
+            if (!measurement.HasPressureValue
+                || measurement.BloodPressureSystolic <= 0
+                || measurement.BloodPressureDiastolic <= 0
+                || measurement.BloodPressureSystolic == 255
+                || measurement.BloodPressureDiastolic == 255)
+            {
+                yield return "pressure";
+            }
+        }
+
+        private static string FormatMeasurementForLog(VitalMeasurement measurement) =>
+            $"EmployeeId={measurement.EmployeeId}, Temp={measurement.Temperature:F2}, HasTemp={measurement.HasTemperatureValue}, TempSource={measurement.TemperatureAssessmentSource}, Alco={measurement.AlcoholLevel:F2}, HasAlco={measurement.HasAlcoholValue}, AlcoholSource={measurement.AlcoholAssessmentSource}, SYS={measurement.BloodPressureSystolic:F0}, DAD={measurement.BloodPressureDiastolic:F0}, HasPressure={measurement.HasPressureValue}, PressureSource={measurement.PressureAssessmentSource}, Timestamp={measurement.Timestamp:O}";
+
         private void ApplyEmployeeStatusVisuals(VitalMeasurement? measurement)
         {
             var alcoholStatus = EvaluateAlcoholStatus(measurement);
@@ -2421,19 +2565,23 @@ namespace SmartWatchProj.ViewModels
             var verdictPresentation = BuildVerdictPresentation(measurement, alcoholStatus, pressureStatus, temperatureStatus);
 
             LogInfo("Assessment", $"Alcohol assessment source: {(measurement is null ? "missing" : measurement.AlcoholAssessmentSource)}");
+            LogInfo("Assessment", $"Temperature assessment source: {(measurement is null ? "missing" : measurement.TemperatureAssessmentSource)}");
+            LogInfo("Assessment", $"Pressure assessment source: {(measurement is null ? "missing" : measurement.PressureAssessmentSource)}");
             LogInfo("Assessment", $"Alcohol raw value resolved to: {(measurement is null ? "null" : measurement.AlcoholLevel.ToString("F2", System.Globalization.CultureInfo.InvariantCulture))}");
             if (measurement is not null && !measurement.HasAlcoholValue)
             {
-                LogInfo("Assessment", "Alcohol value missing -> using warning/unknown instead of red");
+                LogError("Assessment", "detected missing required measurement: alcohol");
             }
-            LogInfo("Assessment", $"Alcohol raw value used for assessment: {(measurement is null ? "null" : measurement.AlcoholLevel.ToString("F2", System.Globalization.CultureInfo.InvariantCulture))}");
+            LogInfo("Assessment", $"final assessment alcohol input: {(measurement is null ? "null" : measurement.AlcoholLevel.ToString("F2", System.Globalization.CultureInfo.InvariantCulture))}");
             LogInfo("Assessment", $"Alcohol status rule branch selected: {GetAlcoholRuleBranchName(measurement, alcoholStatus)}");
             LogInfo("Assessment", $"Pressure raw values used for assessment: SYS={(measurement is null ? "null" : measurement.BloodPressureSystolic.ToString("F0", System.Globalization.CultureInfo.InvariantCulture))}, DAD={(measurement is null ? "null" : measurement.BloodPressureDiastolic.ToString("F0", System.Globalization.CultureInfo.InvariantCulture))}");
-            LogInfo("Assessment", $"Temperature raw value used for assessment: {(measurement is null ? "null" : measurement.Temperature.ToString("F2", System.Globalization.CultureInfo.InvariantCulture))}");
+            LogInfo("Assessment", $"final assessment temperature input: {(measurement is null ? "null" : measurement.Temperature.ToString("F2", System.Globalization.CultureInfo.InvariantCulture))}");
+            LogInfo("Assessment", $"final measurement object before verdict: {(measurement is null ? "null" : FormatMeasurementForLog(measurement))}");
 
             LogInfo("Assessment", $"Alcohol status evaluated: {alcoholStatus.ToString().ToLowerInvariant()}");
             LogInfo("Assessment", $"Pressure status evaluated: {pressureStatus.ToString().ToLowerInvariant()}");
             LogInfo("Assessment", $"Temperature status evaluated: {temperatureStatus.ToString().ToLowerInvariant()}");
+            LogInfo("Assessment", $"temperature rule branch selected: {GetTemperatureRuleBranchName(measurement, temperatureStatus)}");
 
             employeeOverallStatus = EvaluateOverallStatus(alcoholStatus, pressureStatus, temperatureStatus);
             LogInfo("Assessment", $"Overall verdict composed from: alcohol={alcoholStatus.ToString().ToLowerInvariant()}, pressure={pressureStatus.ToString().ToLowerInvariant()}, temperature={temperatureStatus.ToString().ToLowerInvariant()}");
@@ -2573,12 +2721,12 @@ namespace SmartWatchProj.ViewModels
 
             if (!measurement.HasAlcoholValue)
             {
-                return MeasurementStatus.Warning;
+                return MeasurementStatus.Invalid;
             }
 
-            if (measurement.AlcoholLevel < 0 || measurement.AlcoholLevel > 4095)
+            if (measurement.AlcoholLevel <= 0)
             {
-                return MeasurementStatus.Unknown;
+                return MeasurementStatus.Invalid;
             }
 
             if (measurement.AlcoholLevel > 3000)
@@ -2601,14 +2749,19 @@ namespace SmartWatchProj.ViewModels
                 return MeasurementStatus.Unknown;
             }
 
+            if (!measurement.HasPressureValue)
+            {
+                return MeasurementStatus.Invalid;
+            }
+
             if (measurement.BloodPressureSystolic == 255 || measurement.BloodPressureDiastolic == 255)
             {
-                return MeasurementStatus.Warning;
+                return MeasurementStatus.Invalid;
             }
 
             if (measurement.BloodPressureSystolic <= 0 || measurement.BloodPressureDiastolic <= 0)
             {
-                return MeasurementStatus.Warning;
+                return MeasurementStatus.Invalid;
             }
 
             var isHealthy = measurement.BloodPressureSystolic >= 105
@@ -2621,14 +2774,26 @@ namespace SmartWatchProj.ViewModels
 
         private static MeasurementStatus EvaluateTemperatureStatus(VitalMeasurement? measurement)
         {
-            if (measurement is null || measurement.Temperature <= 0)
+            if (measurement is null || !measurement.HasTemperatureValue)
             {
-                return MeasurementStatus.Warning;
+                return MeasurementStatus.Invalid;
             }
 
             return measurement.Temperature > 35
                 ? MeasurementStatus.Risk
                 : MeasurementStatus.Healthy;
+        }
+
+        private static string GetTemperatureRuleBranchName(VitalMeasurement? measurement, MeasurementStatus temperatureStatus)
+        {
+            if (measurement is null || !measurement.HasTemperatureValue)
+            {
+                return "yellow";
+            }
+
+            return temperatureStatus == MeasurementStatus.Risk
+                ? "red"
+                : "green";
         }
 
         private static EmployeeOverallStatus EvaluateOverallStatus(
@@ -2659,7 +2824,7 @@ namespace SmartWatchProj.ViewModels
         {
             if (measurement is null || !measurement.HasAlcoholValue)
             {
-                return "warning-no-data";
+                return "invalid-no-data";
             }
 
             return alcoholStatus switch
@@ -2783,10 +2948,14 @@ namespace SmartWatchProj.ViewModels
                 ActivityLevel = random.Next(1000, 3000),
                 BloodPressureSystolic = random.Next(80, 160),
                 BloodPressureDiastolic = random.Next(50, 100),
+                HasPressureValue = true,
                 Temperature = random.NextDouble() * (38.5 - 35) + 35,
+                HasTemperatureValue = true,
                 Glucose = random.NextDouble() * (8 - 3) + 3,
                 Cholesterol = random.NextDouble() * (7 - 3) + 3,
                 AlcoholLevel = random.NextDouble() * 1.5,
+                HasAlcoholValue = true,
+                AlcoholAssessmentSource = "simulation",
                 Diagnosis = "Симулированные данные"
             };
         }
@@ -2796,6 +2965,7 @@ namespace SmartWatchProj.ViewModels
         /// </summary>
         private (string verdict, Avalonia.Media.IBrush color, List<HealthTile> tiles) CalculateDetailedDiagnosis(VitalMeasurement m)
         {
+            EnsureRequiredMeasurementsForFinalAssessment(m);
             var alcoholStatus = EvaluateAlcoholStatus(m);
             var pressureStatus = EvaluatePressureStatus(m);
             var temperatureStatus = EvaluateTemperatureStatus(m);

@@ -75,16 +75,20 @@ namespace SmartWatchProj.Services.Devices
                 Cholesterol = template.Cholesterol,
                 AlcoholLevel = template.AlcoholLevel,
                 HasAlcoholValue = true,
+                HasTemperatureValue = true,
+                HasPressureValue = true,
                 AlcoholAssessmentSource = "debug-value",
+                TemperatureAssessmentSource = "own-step",
+                PressureAssessmentSource = "own-step",
                 Diagnosis = $"Diagnostics profile: {template.Name}"
             });
         }
 
         private static readonly MeasurementTemplate[] templates =
         {
-            new("Норма", 76, 98, 122, 78, 36.6, 5.1, 4.8, 0.0, 2800),
-            new("Внимание", 104, 94, 142, 92, 37.3, 6.4, 5.9, 0.1, 1600),
-            new("Риск", 128, 89, 168, 104, 37.9, 7.8, 6.6, 0.5, 900)
+            new("Норма", 76, 98, 122, 78, 36.6, 5.1, 4.8, 3500, 2800),
+            new("Внимание", 104, 94, 142, 92, 37.3, 6.4, 5.9, 1600, 1600),
+            new("Риск", 128, 89, 168, 104, 37.9, 7.8, 6.6, 900, 900)
         };
 
         private sealed record MeasurementTemplate(
@@ -185,12 +189,20 @@ namespace SmartWatchProj.Services.Devices
                 Temperature = controllerResponse.Temp,
                 AlcoholLevel = controllerResponse.Alco,
                 HasAlcoholValue = controllerResponse.HasAlcoholValue,
+                HasTemperatureValue = controllerResponse.HasTemperatureValue,
+                HasPressureValue = controllerResponse.HasPressureValue,
                 AlcoholAssessmentSource = controllerResponse.AlcoholSource,
+                TemperatureAssessmentSource = controllerResponse.TemperatureSource,
+                PressureAssessmentSource = controllerResponse.PressureSource,
                 BloodPressureSystolic = controllerResponse.Sys,
                 BloodPressureDiastolic = controllerResponse.Dad,
                 Diagnosis = controllerResponse.ResultSummary
             };
 
+            logStore.Info("Measurements", $"temperature preserved into final measurement: {measurement.Temperature.ToString("F2", CultureInfo.InvariantCulture)}");
+            logStore.Info("Measurements", $"alcohol preserved into final measurement: {measurement.AlcoholLevel.ToString("F0", CultureInfo.InvariantCulture)}");
+            logStore.Info("Measurements", $"pressure preserved into final measurement: SYS={measurement.BloodPressureSystolic.ToString("F0", CultureInfo.InvariantCulture)}, DAD={measurement.BloodPressureDiastolic.ToString("F0", CultureInfo.InvariantCulture)}");
+            logStore.Info("Measurements", $"final measurement source summary: temp={measurement.TemperatureAssessmentSource}, alco={measurement.AlcoholAssessmentSource}, pressure={measurement.PressureAssessmentSource}");
             logStore.Info("Measurements", $"ESP32 controller measurement complete for employee {employeeId}. Source={controllerResponse.SourceLabel}.");
             return measurement;
         }
@@ -307,58 +319,92 @@ namespace SmartWatchProj.Services.Devices
         {
             await ReportStageAsync(hooks, MeasurementWorkflowStage.PrepareTemperature, cancellationToken);
             await ReportStageAsync(hooks, MeasurementWorkflowStage.MeasureTemperature, cancellationToken);
-            await WaitForMeasurementWindowAsync("temperature", controller.TemperaturePreparationDelayMs, cancellationToken);
+            logStore.Info("COM", "temperature measurement command sent");
             await SendControllerCommandAsync(port, TemperatureCommand, controller.DelayBetweenCommandsMs, cancellationToken);
-            var temperatureRead = await ReadOptionalMeasurementDebugAsync(port, controller.TemperatureTimeoutMs, cancellationToken, "temperature debug", TemperatureRegexes);
-            var temperature = TryParseMatchedDouble(temperatureRead.Payload, TemperatureRegexes, out var parsedTemperature)
-                ? parsedTemperature
-                : (double?)null;
+            var temperatureRead = await ReadMeasurementValueAsync(
+                port,
+                controller.TemperatureTimeoutMs,
+                cancellationToken,
+                "temperature",
+                TryRecognizeTemperatureCandidate);
+            var temperature = temperatureRead.Value;
+            var temperatureSource = temperatureRead.Source;
             if (temperature is <= MinimumHumanTemperature)
             {
                 logStore.Warning("COM", $"Temperature looks not ready yet: {temperature}. Waiting {controller.TemperatureRetryDelayMs} ms and retrying x1x1x once.");
                 await WaitForMeasurementWindowAsync("temperature retry", controller.TemperatureRetryDelayMs, cancellationToken);
                 await SendControllerCommandAsync(port, TemperatureCommand, controller.DelayBetweenCommandsMs, cancellationToken);
-                temperatureRead = await ReadOptionalMeasurementDebugAsync(port, controller.TemperatureTimeoutMs, cancellationToken, "temperature debug retry", TemperatureRegexes);
-                temperature = TryParseMatchedDouble(temperatureRead.Payload, TemperatureRegexes, out parsedTemperature)
-                    ? parsedTemperature
-                    : null;
+                var temperatureRetryRead = await ReadMeasurementValueAsync(
+                    port,
+                    controller.TemperatureTimeoutMs,
+                    cancellationToken,
+                    "temperature",
+                    TryRecognizeTemperatureCandidate);
+                if (temperatureRetryRead.Value.HasValue)
+                {
+                    temperature = temperatureRetryRead.Value;
+                    temperatureSource = temperatureRetryRead.Source;
+                }
             }
 
-            if (temperature.HasValue)
+            double? confirmedTemperature = null;
+            var confirmedTemperatureSource = "missing";
+            if (HasReceivedTemperatureValue(temperature))
             {
-                logStore.Info("COM", $"Parsed temperature: {temperature.Value}");
+                confirmedTemperature = temperature.GetValueOrDefault();
+                confirmedTemperatureSource = string.IsNullOrWhiteSpace(temperatureSource) ? "own-step" : temperatureSource;
+                logStore.Info("COM", $"Parsed temperature: {confirmedTemperature}");
+                logStore.Info("COM", $"temperature candidate recognized from own-step payload: {confirmedTemperature.Value.ToString("F2", CultureInfo.InvariantCulture)}");
+                logStore.Info("COM", $"temperature accepted with source={confirmedTemperatureSource}");
             }
             else
             {
-                logStore.Warning("COM", "Temperature debug value not received within timeout. Continuing and waiting for final JSON.");
+                logStore.Warning("COM", "temperature debug missing, awaiting final JSON");
             }
 
             await ReportStageAsync(hooks, MeasurementWorkflowStage.PrepareAlcohol, cancellationToken);
             await ReportStageAsync(hooks, MeasurementWorkflowStage.MeasureAlcohol, cancellationToken);
-            await WaitForMeasurementWindowAsync("alcohol", controller.AlcoholPreparationDelayMs, cancellationToken);
+            logStore.Info("COM", "alcohol measurement command sent");
             await SendControllerCommandAsync(port, AlcoholCommand, controller.DelayBetweenCommandsMs, cancellationToken);
-            var alcoholRead = await ReadOptionalMeasurementDebugAsync(port, controller.AlcoholTimeoutMs, cancellationToken, "alcohol debug", AlcoholRegexes);
-            var alcohol = TryParseMatchedDouble(alcoholRead.Payload, AlcoholRegexes, out var parsedAlcohol)
-                ? parsedAlcohol
-                : (double?)null;
-            if (alcohol >= InvalidAlcoholRawThreshold)
+            var alcoholRead = await ReadMeasurementValueAsync(
+                port,
+                controller.AlcoholTimeoutMs,
+                cancellationToken,
+                "alcohol",
+                TryRecognizeAlcoholCandidate);
+            var alcohol = alcoholRead.Value;
+            var alcoholSource = alcoholRead.Source;
+            if (!alcohol.HasValue)
             {
-                logStore.Warning("COM", $"Alcohol sensor still returns raw value {alcohol}. Waiting {controller.AlcoholRetryDelayMs} ms and retrying x1x2x once.");
+                logStore.Warning("COM", $"Alcohol value not received yet. Waiting {controller.AlcoholRetryDelayMs} ms and retrying x1x2x once.");
                 await WaitForMeasurementWindowAsync("alcohol retry", controller.AlcoholRetryDelayMs, cancellationToken);
                 await SendControllerCommandAsync(port, AlcoholCommand, controller.DelayBetweenCommandsMs, cancellationToken);
-                alcoholRead = await ReadOptionalMeasurementDebugAsync(port, controller.AlcoholTimeoutMs, cancellationToken, "alcohol debug retry", AlcoholRegexes);
-                alcohol = TryParseMatchedDouble(alcoholRead.Payload, AlcoholRegexes, out parsedAlcohol)
-                    ? parsedAlcohol
-                    : null;
+                var alcoholRetryRead = await ReadMeasurementValueAsync(
+                    port,
+                    controller.AlcoholTimeoutMs,
+                    cancellationToken,
+                    "alcohol",
+                    TryRecognizeAlcoholCandidate);
+                if (alcoholRetryRead.Value.HasValue)
+                {
+                    alcohol = alcoholRetryRead.Value;
+                    alcoholSource = alcoholRetryRead.Source;
+                }
             }
 
-            if (alcohol.HasValue)
+            double? confirmedAlcohol = null;
+            var confirmedAlcoholSource = "missing";
+            if (HasReceivedAlcoholValue(alcohol))
             {
-                logStore.Info("COM", $"Parsed alco: {alcohol.Value}");
+                confirmedAlcohol = alcohol.GetValueOrDefault();
+                confirmedAlcoholSource = string.IsNullOrWhiteSpace(alcoholSource) ? "own-step" : alcoholSource;
+                logStore.Info("COM", $"Parsed alco: {confirmedAlcohol}");
+                logStore.Info("COM", $"alcohol candidate recognized from own-step payload: {confirmedAlcohol.Value.ToString("F0", CultureInfo.InvariantCulture)}");
+                logStore.Info("COM", $"alcohol accepted with source={confirmedAlcoholSource}");
             }
             else
             {
-                logStore.Warning("COM", "Alcohol debug value not received within timeout. Continuing and waiting for final JSON.");
+                logStore.Warning("COM", "alcohol debug missing, awaiting final JSON");
             }
 
             await ReportStageAsync(hooks, MeasurementWorkflowStage.PreparePressure, cancellationToken);
@@ -366,6 +412,7 @@ namespace SmartWatchProj.Services.Devices
             logStore.Info("COM", "Pressure measurement dispatch starting after prep confirmation.");
             ResetPressureMeasurementState(port);
             logStore.Info("COM", $"Pressure command dispatch starting: {PressureCommand}");
+            logStore.Info("COM", "pressure measurement command sent");
             await SendControllerCommandAsync(port, PressureCommand, controller.DelayBetweenCommandsMs, cancellationToken);
             var pressureReadResult = await ReadPressureAndTryFinalJsonAsync(
                 port,
@@ -374,6 +421,7 @@ namespace SmartWatchProj.Services.Devices
                 cancellationToken,
                 "NIBP completion + SAD + DAD");
             await ReportStageAsync(hooks, MeasurementWorkflowStage.ProcessingResults, cancellationToken);
+            logStore.Info("COM", "full measurement cycle completed before final validation");
 
             var finalJsonPayload = pressureReadResult.FinalJsonPayload;
             if (!string.IsNullOrWhiteSpace(finalJsonPayload))
@@ -381,56 +429,48 @@ namespace SmartWatchProj.Services.Devices
                 logStore.Info("COM", $"Final raw payload: {finalJsonPayload}");
                 var finalJson = ParseFinalJsonPayload(finalJsonPayload);
                 logStore.Info("COM", "JSON parse success");
-                return new ControllerResponse(
+                var resolvedTemperature = ResolveTemperatureMeasurementValue(
+                    confirmedTemperature,
+                    confirmedTemperature.HasValue ? confirmedTemperatureSource : "missing",
                     finalJson.Temp,
+                    pressureReadResult.FinalJsonSource);
+
+                var resolvedAlcohol = ResolveAlcoholMeasurementValue(
+                    confirmedAlcohol,
+                    confirmedAlcohol.HasValue ? confirmedAlcoholSource : "missing",
                     finalJson.Alco,
+                    pressureReadResult.FinalJsonSource);
+
+                EnsureRealPressureValues(finalJson.Sys, finalJson.Dad, pressureReadResult.FinalJsonSource);
+                logStore.Info("COM", $"pressure candidate recognized: SYS={finalJson.Sys.ToString("F0", CultureInfo.InvariantCulture)}, DAD={finalJson.Dad.ToString("F0", CultureInfo.InvariantCulture)}");
+                logStore.Info("COM", $"pressure final JSON accepted with source={pressureReadResult.FinalJsonSource}");
+                return new ControllerResponse(
+                    resolvedTemperature.Value,
+                    resolvedTemperature.Source,
+                    resolvedAlcohol.Value,
                     true,
-                    "final-json",
+                    resolvedAlcohol.Source,
+                    true,
                     finalJson.Sys,
                     finalJson.Dad,
+                    true,
+                    pressureReadResult.FinalJsonSource,
                     "final-json",
-                    BuildResultSummary(finalJson.Temp, Math.Min(finalJson.Alco, 4094), finalJson.Sys, finalJson.Dad, fromFinalJson: true));
+                    BuildResultSummary(resolvedTemperature.Value, resolvedAlcohol.Value, finalJson.Sys, finalJson.Dad, fromFinalJson: true));
             }
 
             if (pressureReadResult.Status == PressureStepStatus.InvalidResult)
             {
+                logStore.Warning("COM", "pressure not confirmed on own step");
                 logStore.Warning("COM", $"Pressure step completed-with-invalid-pressure-data. Relevant={pressureReadResult.RelevantSummary}");
-                var resolvedTemperature = temperature ?? 0;
-                var resolvedAlcohol = alcohol ?? 0;
-                var hasAlcoholValue = alcohol.HasValue;
-                var alcoholSource = alcohol.HasValue ? "debug-value" : "missing";
-
-                if (pressureReadResult.InvalidPlaceholderFinalJsonPayload is { } invalidPlaceholderFinalJsonPayload)
-                {
-                    var invalidPlaceholderFinalJson = ParseFinalJsonPayload(invalidPlaceholderFinalJsonPayload);
-                    resolvedTemperature = invalidPlaceholderFinalJson.Temp;
-                    resolvedAlcohol = invalidPlaceholderFinalJson.Alco;
-                    hasAlcoholValue = true;
-                    alcoholSource = "final-json";
-                    logStore.Info("COM", $"Using alcohol from invalid pressure placeholder final JSON: Alco={invalidPlaceholderFinalJson.Alco}, Temp={invalidPlaceholderFinalJson.Temp}");
-                }
-
-                return new ControllerResponse(
-                    resolvedTemperature,
-                    Math.Min(resolvedAlcohol, 4094),
-                    hasAlcoholValue,
-                    alcoholSource,
-                    255,
-                    255,
-                    "pressure-invalid-placeholder",
-                    BuildResultSummary(resolvedTemperature, Math.Min(resolvedAlcohol, 4094), 255, 255, fromFinalJson: false));
+                logStore.Warning("COM", "controller reset initiated after pressure failure");
+                throw new InvalidOperationException($"measurement flow failure reason: pressure invalid placeholder/no real pressure result. Relevant={pressureReadResult.RelevantSummary}");
             }
 
+            logStore.Warning("COM", "pressure not confirmed on own step");
             logStore.Warning("COM", $"Pressure step completed-without-final-pressure-data. Status={pressureReadResult.Status}; Relevant={pressureReadResult.RelevantSummary}");
-            return new ControllerResponse(
-                temperature ?? 0,
-                Math.Min(alcohol ?? 0, 4094),
-                alcohol.HasValue,
-                alcohol.HasValue ? "debug-value" : "missing",
-                0,
-                0,
-                pressureReadResult.Status == PressureStepStatus.NoData ? "pressure-no-data" : "pressure-timeout",
-                BuildResultSummary(temperature ?? 0, Math.Min(alcohol ?? 0, 4094), 0, 0, fromFinalJson: false));
+            logStore.Warning("COM", "controller reset initiated after pressure failure");
+            throw new InvalidOperationException($"measurement flow failure reason: pressure final JSON not received. Status={pressureReadResult.Status}; Relevant={pressureReadResult.RelevantSummary}");
         }
 
         private async Task<PressureAndFinalJsonReadResult> ReadPressureAndTryFinalJsonAsync(
@@ -449,6 +489,7 @@ namespace SmartWatchProj.Services.Devices
             var relevantEntries = new List<string>();
             var pressureRelatedSeen = false;
             var invalidPlaceholderSeen = false;
+            var anyChunkSeen = false;
             string? invalidPlaceholderFinalJsonPayload = null;
             string? lastParseFailureReason = null;
 
@@ -461,12 +502,13 @@ namespace SmartWatchProj.Services.Devices
                 var chunk = port.ReadExisting();
                 if (!string.IsNullOrEmpty(chunk))
                 {
-                    logStore.Info("COM", $"Raw chunk: {chunk}");
+                    anyChunkSeen = true;
+                    logStore.Info("COM", $"raw serial chunk received on pressure step: {chunk}");
                     combinedBuffer += chunk;
                     foreach (var line in SplitPressureChunkLines(chunk))
                     {
                         var classification = ClassifyPressureLine(line);
-                        logStore.Info("COM", $"Parsed line during pressure wait: {line}");
+                        logStore.Info("COM", $"parsed pressure candidate: {line}");
 
                         switch (classification)
                         {
@@ -481,7 +523,7 @@ namespace SmartWatchProj.Services.Devices
                                 logStore.Info("COM", $"Line classified as relevant: {line}");
                                 break;
                             default:
-                                logStore.Info("COM", $"Line classified as ignored: {line}. Reason: {GetPressureIgnoredReason(line)}");
+                                logStore.Info("COM", $"pressure line ignored: reason={GetPressureIgnoredReason(line)}; line={line}");
                                 break;
                         }
                     }
@@ -510,14 +552,14 @@ namespace SmartWatchProj.Services.Devices
                         try
                         {
                             var finalJson = ParseFinalJsonPayload(jsonCandidate);
-                            logStore.Info("COM", $"Recognized pressure final JSON: Temp={finalJson.Temp}, Alco={finalJson.Alco}, SYS={finalJson.Sys}, DAD={finalJson.Dad}");
+                            logStore.Info("COM", $"pressure final JSON accepted: Temp={finalJson.Temp}, Alco={finalJson.Alco}, SYS={finalJson.Sys}, DAD={finalJson.Dad}");
 
                             if (IsInvalidPressurePlaceholder(finalJson))
                             {
                                 invalidPlaceholderSeen = true;
                                 invalidPlaceholderFinalJsonPayload = jsonCandidate;
                                 logStore.Warning("COM", $"Pressure final JSON is invalid placeholder/debug result 255/255: {jsonCandidate}");
-                                logStore.Warning("COM", "Pressure result rejected: invalid-result");
+                                logStore.Warning("COM", "pressure final JSON rejected: reason=invalid pressure placeholder 255/255");
                                 continue;
                             }
 
@@ -526,6 +568,7 @@ namespace SmartWatchProj.Services.Devices
                             return new PressureAndFinalJsonReadResult(
                                 pressurePayload,
                                 jsonCandidate,
+                                "final-json",
                                 PressureStepStatus.Success,
                                 BuildRelevantSummary(relevantEntries),
                                 invalidPlaceholderFinalJsonPayload);
@@ -533,7 +576,7 @@ namespace SmartWatchProj.Services.Devices
                         catch (Exception ex)
                         {
                             lastParseFailureReason = ex.Message;
-                            logStore.Warning("COM", $"Pressure JSON candidate rejected: {ex.Message}");
+                            logStore.Warning("COM", $"pressure final JSON rejected: reason={ex.Message}");
                         }
                     }
                 }
@@ -541,12 +584,49 @@ namespace SmartWatchProj.Services.Devices
                 await Task.Delay(100, cancellationToken);
             }
 
+            var tailFinalJsonTimeoutMs = Math.Max(finalJsonTimeoutMs, 1500);
+            if (!invalidPlaceholderSeen)
+            {
+                logStore.Info("COM", $"Attempting pressure final JSON tail read after main wait window: tailTimeout={tailFinalJsonTimeoutMs} ms.");
+                var tailFinalJsonPayload = await TryReadFinalJsonAsync(
+                    port,
+                    tailFinalJsonTimeoutMs,
+                    cancellationToken,
+                    combinedBuffer);
+
+                if (!string.IsNullOrWhiteSpace(tailFinalJsonPayload))
+                {
+                    var tailFinalJson = ParseFinalJsonPayload(tailFinalJsonPayload);
+                    if (IsInvalidPressurePlaceholder(tailFinalJson))
+                    {
+                        invalidPlaceholderSeen = true;
+                        invalidPlaceholderFinalJsonPayload = tailFinalJsonPayload;
+                        logStore.Warning("COM", "pressure final JSON rejected: reason=tail read returned invalid pressure placeholder 255/255");
+                    }
+                    else
+                    {
+                        relevantEntries.Add($"tail-json:{tailFinalJsonPayload}");
+                        logStore.Info("COM", $"pressure final JSON accepted: Temp={tailFinalJson.Temp}, Alco={tailFinalJson.Alco}, SYS={tailFinalJson.Sys}, DAD={tailFinalJson.Dad}");
+                        logStore.Info("COM", "Pressure step status: success");
+                        return new PressureAndFinalJsonReadResult(
+                            pressurePayload,
+                            tailFinalJsonPayload,
+                            "recovered-from-tail",
+                            PressureStepStatus.Success,
+                            BuildRelevantSummary(relevantEntries),
+                            invalidPlaceholderFinalJsonPayload);
+                    }
+                }
+            }
+
             if (invalidPlaceholderSeen)
             {
+                logStore.Warning("COM", $"port state during pressure failure: isOpen={port.IsOpen}, bytesToRead={SafeGetBytesToRead(port)}");
                 logStore.Warning("COM", $"Pressure step status: invalid-result. Relevant activity: {BuildRelevantSummary(relevantEntries)}");
                 return new PressureAndFinalJsonReadResult(
                     pressurePayload,
                     null,
+                    "missing",
                     PressureStepStatus.InvalidResult,
                     BuildRelevantSummary(relevantEntries),
                     invalidPlaceholderFinalJsonPayload);
@@ -563,19 +643,33 @@ namespace SmartWatchProj.Services.Devices
                     logStore.Warning("COM", "Pressure-related messages arrived, but no valid final JSON was accepted before timeout.");
                 }
 
+                logStore.Warning("COM", $"pressure wait ended with chunks but none accepted. chunksSeen={anyChunkSeen}");
+                logStore.Warning("COM", $"port state during pressure failure: isOpen={port.IsOpen}, bytesToRead={SafeGetBytesToRead(port)}");
                 logStore.Warning("COM", $"Pressure step status: timeout. Relevant activity: {BuildRelevantSummary(relevantEntries)}");
                 return new PressureAndFinalJsonReadResult(
                     pressurePayload,
                     null,
+                    "missing",
                     PressureStepStatus.Timeout,
                     BuildRelevantSummary(relevantEntries),
                     invalidPlaceholderFinalJsonPayload);
             }
 
+            if (!anyChunkSeen)
+            {
+                logStore.Warning("COM", "pressure wait ended with no chunks at all");
+            }
+            else
+            {
+                logStore.Warning("COM", "pressure wait ended with chunks but none accepted");
+            }
+
+            logStore.Warning("COM", $"port state during pressure failure: isOpen={port.IsOpen}, bytesToRead={SafeGetBytesToRead(port)}");
             logStore.Warning("COM", $"Pressure step status: no-data. No relevant pressure/final JSON data received within {effectivePressureTimeoutMs} ms.");
             return new PressureAndFinalJsonReadResult(
                 pressurePayload,
                 null,
+                "missing",
                 PressureStepStatus.NoData,
                 "none",
                 invalidPlaceholderFinalJsonPayload);
@@ -701,6 +795,39 @@ namespace SmartWatchProj.Services.Devices
 
             logStore.Warning("COM", $"ESP32 controller did not return optional {expectedLabel} within {timeoutMs} ms. Payload={buffer}");
             return new OptionalDebugReadResult(buffer, false);
+        }
+
+        private async Task<MeasurementValueReadResult> ReadMeasurementValueAsync(
+            SerialPort port,
+            int timeoutMs,
+            CancellationToken cancellationToken,
+            string stepName,
+            Func<string, (bool Success, double Value, string Source)> recognizer)
+        {
+            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            var buffer = string.Empty;
+
+            while (DateTime.UtcNow < deadline)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var chunk = port.ReadExisting();
+                if (!string.IsNullOrEmpty(chunk))
+                {
+                    logStore.Info("COM", $"raw serial chunk received on {stepName} step: {chunk}");
+                    buffer += chunk;
+
+                    var recognized = recognizer(buffer);
+                    if (recognized.Success)
+                    {
+                        return new MeasurementValueReadResult(buffer, recognized.Value, recognized.Source);
+                    }
+                }
+
+                await Task.Delay(100, cancellationToken);
+            }
+
+            return new MeasurementValueReadResult(buffer, null, "missing");
         }
 
         private async Task<string> ReadUntilAllMatchesAsync(
@@ -911,8 +1038,7 @@ namespace SmartWatchProj.Services.Devices
                 return;
             }
 
-            port.DiscardInBuffer();
-            logStore.Info("COM", "Pressure measurement stale state reset before x1x3x.");
+            logStore.Info("COM", "Pressure measurement state checked before x1x3x without blind buffer discard.");
         }
 
         private static IEnumerable<string> SplitPressureChunkLines(string chunk)
@@ -965,6 +1091,18 @@ namespace SmartWatchProj.Services.Devices
         private static bool IsInvalidPressurePlaceholder(FinalJsonPayload payload) =>
             payload.Sys == 255 && payload.Dad == 255;
 
+        private static int SafeGetBytesToRead(SerialPort port)
+        {
+            try
+            {
+                return port.IsOpen ? port.BytesToRead : 0;
+            }
+            catch
+            {
+                return -1;
+            }
+        }
+
         private static string BuildRelevantSummary(IEnumerable<string> entries)
         {
             var materialized = entries
@@ -1016,7 +1154,7 @@ namespace SmartWatchProj.Services.Devices
             var source = fromFinalJson ? "final JSON" : "debug/raw";
             var issues = new List<string>();
 
-            if (alcohol >= 4095)
+            if (alcohol > 4095)
             {
                 issues.Add("алкоголь выглядит как raw ADC 4095");
             }
@@ -1070,6 +1208,92 @@ namespace SmartWatchProj.Services.Devices
             return TryParseFinalJsonFromAccumulatedBuffer(ref currentFinalBuffer, ref lastParseFailureReason, out candidate);
         }
 
+        private (bool Success, double Value, string Source) TryRecognizeTemperatureCandidate(string payload)
+        {
+            if (TryParseMatchedDouble(payload, TemperatureRegexes, out var legacyTemperature))
+            {
+                return (true, legacyTemperature, "legacy-debug");
+            }
+
+            if (TryParseFieldValue(payload, new[] { "IRTemperature", "Temperature", "Temp" }, out var structuredTemperature))
+            {
+                return (true, structuredTemperature, "own-step");
+            }
+
+            if (TryParseStandaloneNumericLine(payload, value => value > 0 && value < 100, out var numericTemperature))
+            {
+                return (true, numericTemperature, "own-step");
+            }
+
+            return (false, default, "missing");
+        }
+
+        private (bool Success, double Value, string Source) TryRecognizeAlcoholCandidate(string payload)
+        {
+            if (TryParseMatchedDouble(payload, AlcoholRegexes, out var legacyAlcohol))
+            {
+                return (true, legacyAlcohol, "legacy-debug");
+            }
+
+            if (TryParseFieldValue(payload, new[] { "Alcohol", "Alco" }, out var structuredAlcohol))
+            {
+                return (true, structuredAlcohol, "own-step");
+            }
+
+            if (TryParseStandaloneNumericLine(payload, value => value > 0 && value <= InvalidAlcoholRawThreshold, out var numericAlcohol))
+            {
+                return (true, numericAlcohol, "own-step");
+            }
+
+            return (false, default, "missing");
+        }
+
+        private static bool TryParseFieldValue(string payload, IEnumerable<string> fieldNames, out double value)
+        {
+            foreach (var fieldName in fieldNames)
+            {
+                var regex = new Regex($@"(?<![A-Za-z])""?{Regex.Escape(fieldName)}""?\s*[:=]\s*(?<value>-?\d+(?:[.,]\d+)?)",
+                    RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+                if (!TryParseMatchedDouble(payload, new[] { regex }, out value))
+                {
+                    continue;
+                }
+
+                return true;
+            }
+
+            value = default;
+            return false;
+        }
+
+        private static bool TryParseStandaloneNumericLine(string payload, Func<double, bool> isAllowedValue, out double value)
+        {
+            var lines = payload
+                .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+            for (var index = lines.Length - 1; index >= 0; index--)
+            {
+                var line = lines[index].Replace(',', '.');
+                if (!Regex.IsMatch(line, @"^-?\d+(?:\.\d+)?$", RegexOptions.CultureInvariant))
+                {
+                    continue;
+                }
+
+                if (!double.TryParse(line, NumberStyles.Float, CultureInfo.InvariantCulture, out value))
+                {
+                    continue;
+                }
+
+                if (isAllowedValue(value))
+                {
+                    return true;
+                }
+            }
+
+            value = default;
+            return false;
+        }
+
         private static double ParseMatchedDouble(string payload, IEnumerable<Regex> regexes, string fieldName)
         {
             if (!TryParseMatchedDouble(payload, regexes, out var value))
@@ -1113,6 +1337,109 @@ namespace SmartWatchProj.Services.Devices
             return value.Value;
         }
 
+        private (double Value, string Source) ResolveRequiredMeasurementValue(
+            double? debugValue,
+            string debugSource,
+            double finalJsonValue,
+            string finalJsonSource,
+            Func<double?, bool> isRealValue,
+            string fieldName)
+        {
+            if (debugValue.HasValue && isRealValue(debugValue))
+            {
+                return (debugValue.Value, debugSource);
+            }
+
+            if (isRealValue(finalJsonValue))
+            {
+                return (finalJsonValue, finalJsonSource);
+            }
+
+            var reason = $"{fieldName} missing or sentinel value after debug/final JSON. debug={(debugValue.HasValue ? debugValue.Value.ToString(CultureInfo.InvariantCulture) : "missing")}, finalJson={finalJsonValue.ToString(CultureInfo.InvariantCulture)}";
+            logStore.Error("COM", $"detected missing required measurement: {fieldName}");
+            logStore.Error("COM", $"measurement flow failure reason: {reason}");
+            throw new InvalidOperationException($"measurement flow failure reason: {reason}");
+        }
+
+        private (double Value, string Source) ResolveTemperatureMeasurementValue(
+            double? debugValue,
+            string debugSource,
+            double finalJsonValue,
+            string finalJsonSource)
+        {
+            if (HasReceivedTemperatureValue(debugValue))
+            {
+                logStore.Info("COM", $"temperature preserved from {debugSource}: {debugValue.Value.ToString("F2", CultureInfo.InvariantCulture)}");
+                return (debugValue.Value, debugSource);
+            }
+
+            if (HasReceivedTemperatureValue(finalJsonValue))
+            {
+                logStore.Info("COM", $"temperature candidate recognized from final JSON: {finalJsonValue.ToString("F2", CultureInfo.InvariantCulture)}");
+                logStore.Info("COM", $"final JSON temperature accepted: {finalJsonValue.ToString("F2", CultureInfo.InvariantCulture)}");
+                logStore.Info("COM", "temperature value classified as received, not missing");
+                logStore.Info("COM", "HasTemperatureValue set from final JSON");
+                return (finalJsonValue, finalJsonSource);
+            }
+
+            var reason = $"temperature missing after debug/final JSON. debug={(debugValue.HasValue ? debugValue.Value.ToString(CultureInfo.InvariantCulture) : "missing")}, finalJson={finalJsonValue.ToString(CultureInfo.InvariantCulture)}";
+            logStore.Error("COM", "detected missing required measurement: temperature");
+            logStore.Error("COM", $"measurement flow failure reason: {reason}");
+            throw new InvalidOperationException($"measurement flow failure reason: {reason}");
+        }
+
+        private (double Value, string Source) ResolveAlcoholMeasurementValue(
+            double? debugValue,
+            string debugSource,
+            double finalJsonValue,
+            string finalJsonSource)
+        {
+            if (HasReceivedAlcoholValue(debugValue))
+            {
+                logStore.Info("COM", $"alcohol preserved from {debugSource}: {debugValue.Value.ToString("F0", CultureInfo.InvariantCulture)}");
+                return (debugValue.Value, debugSource);
+            }
+
+            if (HasReceivedAlcoholValue(finalJsonValue))
+            {
+                logStore.Info("COM", $"alcohol candidate recognized from final JSON: {finalJsonValue.ToString("F0", CultureInfo.InvariantCulture)}");
+                logStore.Info("COM", $"final JSON alcohol accepted: {finalJsonValue.ToString("F0", CultureInfo.InvariantCulture)}");
+                logStore.Info("COM", "alcohol value classified as received, not missing");
+                logStore.Info("COM", "HasAlcoholValue set from final JSON");
+                return (finalJsonValue, finalJsonSource);
+            }
+
+            var reason = $"alcohol missing after debug/final JSON. debug={(debugValue.HasValue ? debugValue.Value.ToString(CultureInfo.InvariantCulture) : "missing")}, finalJson={finalJsonValue.ToString(CultureInfo.InvariantCulture)}";
+            logStore.Error("COM", "detected missing required measurement: alcohol");
+            logStore.Error("COM", $"measurement flow failure reason: {reason}");
+            throw new InvalidOperationException($"measurement flow failure reason: {reason}");
+        }
+
+        private static bool IsRealTemperatureValue(double? value) =>
+            value.HasValue && value.Value > MinimumHumanTemperature;
+
+        private static bool HasReceivedTemperatureValue(double? value) =>
+            value.HasValue && !double.IsNaN(value.Value) && !double.IsInfinity(value.Value);
+
+        private static bool IsRealAlcoholValue(double? value) =>
+            value.HasValue && value.Value > 0 && value.Value <= InvalidAlcoholRawThreshold;
+
+        private static bool HasReceivedAlcoholValue(double? value) =>
+            value.HasValue && value.Value > 0 && !double.IsNaN(value.Value) && !double.IsInfinity(value.Value);
+
+        private void EnsureRealPressureValues(double sys, double dad, string source)
+        {
+            if (sys > 0 && dad > 0 && sys != 255 && dad != 255)
+            {
+                return;
+            }
+
+            var reason = $"pressure missing or sentinel value from {source}. SYS={sys.ToString(CultureInfo.InvariantCulture)}, DAD={dad.ToString(CultureInfo.InvariantCulture)}";
+            logStore.Error("COM", "detected missing required measurement: pressure");
+            logStore.Error("COM", $"measurement flow failure reason: {reason}");
+            throw new InvalidOperationException($"measurement flow failure reason: {reason}");
+        }
+
         private static Esp32ControllerConfig RequireController(Esp32ControllerConfig? controller) =>
             controller ?? throw new InvalidOperationException(
                 $"В {ConfigFileName} не настроен блок 'controller'. Для production-режима нужен один реальный COM-порт ESP32.");
@@ -1148,10 +1475,11 @@ namespace SmartWatchProj.Services.Devices
             JsonCandidate
         }
 
-        private sealed record ControllerResponse(double Temp, double Alco, bool HasAlcoholValue, string AlcoholSource, double Sys, double Dad, string SourceLabel, string ResultSummary);
+        private sealed record ControllerResponse(double Temp, string TemperatureSource, double Alco, bool HasAlcoholValue, string AlcoholSource, bool HasTemperatureValue, double Sys, double Dad, bool HasPressureValue, string PressureSource, string SourceLabel, string ResultSummary);
         private sealed record FinalJsonPayload(double Temp, double Alco, double Sys, double Dad);
-        private sealed record PressureAndFinalJsonReadResult(string PressurePayload, string? FinalJsonPayload, PressureStepStatus Status, string RelevantSummary, string? InvalidPlaceholderFinalJsonPayload);
+        private sealed record PressureAndFinalJsonReadResult(string PressurePayload, string? FinalJsonPayload, string FinalJsonSource, PressureStepStatus Status, string RelevantSummary, string? InvalidPlaceholderFinalJsonPayload);
         private sealed record OptionalDebugReadResult(string Payload, bool Matched);
+        private sealed record MeasurementValueReadResult(string Payload, double? Value, string Source);
 
         private sealed class DevicePortMapConfig
         {

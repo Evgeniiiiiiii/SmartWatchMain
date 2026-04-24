@@ -576,6 +576,7 @@ namespace SmartWatchProj.ViewModels
                 throw new InvalidOperationException("measurement result is null");
             }
 
+            LogInfo("Measurements", $"Provider returned measurement: {FormatMeasurementForLog(measurement)}");
             return measurement;
         }
 

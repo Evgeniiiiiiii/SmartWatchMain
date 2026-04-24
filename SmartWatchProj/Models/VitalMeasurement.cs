@@ -25,7 +25,19 @@ namespace SmartWatchProj.Models
         public bool HasAlcoholValue { get; set; }
 
         [JsonIgnore]
+        public bool HasTemperatureValue { get; set; }
+
+        [JsonIgnore]
+        public bool HasPressureValue { get; set; }
+
+        [JsonIgnore]
         public string AlcoholAssessmentSource { get; set; } = "missing";
+
+        [JsonIgnore]
+        public string TemperatureAssessmentSource { get; set; } = "missing";
+
+        [JsonIgnore]
+        public string PressureAssessmentSource { get; set; } = "missing";
 
         public string? Diagnosis { get; set; }
         public string? Recommendation { get; set; } // "Зелёный", "Жёлтый", "Красный"
