@@ -480,6 +480,7 @@ namespace SmartWatchProj.Services.Devices
             CancellationToken cancellationToken,
             string expectedLabel)
         {
+            var pressureWaitStartedAt = DateTime.UtcNow;
             var effectivePressureTimeoutMs = Math.Max(pressureTimeoutMs, 35000);
             var pressureDeadline = DateTime.UtcNow.AddMilliseconds(effectivePressureTimeoutMs);
             var hardDeadline = pressureDeadline.AddMilliseconds(Math.Max(finalJsonTimeoutMs, 0));
@@ -493,6 +494,7 @@ namespace SmartWatchProj.Services.Devices
             string? invalidPlaceholderFinalJsonPayload = null;
             string? lastParseFailureReason = null;
 
+            logStore.Info("COM", $"pressure wait started at timestamp: {pressureWaitStartedAt:O}");
             logStore.Info("COM", $"Pressure wait window started: timeout={effectivePressureTimeoutMs} ms, finalJsonTail={finalJsonTimeoutMs} ms, expected={expectedLabel}.");
 
             while (DateTime.UtcNow < currentDeadline)
@@ -607,6 +609,7 @@ namespace SmartWatchProj.Services.Devices
                     {
                         relevantEntries.Add($"tail-json:{tailFinalJsonPayload}");
                         logStore.Info("COM", $"pressure final JSON accepted: Temp={tailFinalJson.Temp}, Alco={tailFinalJson.Alco}, SYS={tailFinalJson.Sys}, DAD={tailFinalJson.Dad}");
+                        logStore.Info("COM", "pressure late/tail JSON accepted after main window");
                         logStore.Info("COM", "Pressure step status: success");
                         return new PressureAndFinalJsonReadResult(
                             pressurePayload,
@@ -657,6 +660,53 @@ namespace SmartWatchProj.Services.Devices
 
             if (!anyChunkSeen)
             {
+                var latePressureTimeoutMs = Math.Min(Math.Max(finalJsonTimeoutMs * 2, 8000), 15000);
+                logStore.Warning("COM", $"controller-side cycle still active / awaiting late result: lateWindow={latePressureTimeoutMs} ms");
+                logStore.Info("COM", $"Attempting extended pressure late read after no-data main window: timeout={latePressureTimeoutMs} ms.");
+                var lateFinalJsonPayload = await TryReadFinalJsonAsync(
+                    port,
+                    latePressureTimeoutMs,
+                    cancellationToken,
+                    combinedBuffer);
+
+                if (!string.IsNullOrWhiteSpace(lateFinalJsonPayload))
+                {
+                    var lateFinalJson = ParseFinalJsonPayload(lateFinalJsonPayload);
+                    if (IsInvalidPressurePlaceholder(lateFinalJson))
+                    {
+                        invalidPlaceholderSeen = true;
+                        invalidPlaceholderFinalJsonPayload = lateFinalJsonPayload;
+                        logStore.Warning("COM", "pressure final JSON rejected: reason=extended late read returned invalid pressure placeholder 255/255");
+                    }
+                    else
+                    {
+                        relevantEntries.Add($"late-json:{lateFinalJsonPayload}");
+                        logStore.Info("COM", $"pressure final JSON accepted: Temp={lateFinalJson.Temp}, Alco={lateFinalJson.Alco}, SYS={lateFinalJson.Sys}, DAD={lateFinalJson.Dad}");
+                        logStore.Info("COM", "pressure late/tail JSON accepted after main window");
+                        logStore.Info("COM", "Pressure step status: success");
+                        return new PressureAndFinalJsonReadResult(
+                            pressurePayload,
+                            lateFinalJsonPayload,
+                            "recovered-from-late-read",
+                            PressureStepStatus.Success,
+                            BuildRelevantSummary(relevantEntries),
+                            invalidPlaceholderFinalJsonPayload);
+                    }
+                }
+
+                if (invalidPlaceholderSeen)
+                {
+                    logStore.Warning("COM", $"port state during pressure failure: isOpen={port.IsOpen}, bytesToRead={SafeGetBytesToRead(port)}");
+                    logStore.Warning("COM", $"Pressure step status: invalid-result. Relevant activity: {BuildRelevantSummary(relevantEntries)}");
+                    return new PressureAndFinalJsonReadResult(
+                        pressurePayload,
+                        null,
+                        "missing",
+                        PressureStepStatus.InvalidResult,
+                        BuildRelevantSummary(relevantEntries),
+                        invalidPlaceholderFinalJsonPayload);
+                }
+
                 logStore.Warning("COM", "pressure wait ended with no chunks at all");
             }
             else
